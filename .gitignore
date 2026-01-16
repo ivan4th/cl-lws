@@ -1,0 +1,19 @@
+# CFFI-Grovel generated files
+grovel__grovel
+grovel__grovel.c
+grovel__grovel.o
+grovel__grovel.grovel-tmp.lisp
+wrappers__wrapper.c
+wrappers__wrapper.o
+wrappers.grovel-tmp.lisp
+
+# CFFI wrapper shared library
+lws-wrappers.dylib
+lws-wrappers.so
+
+# Compiled Lisp files
+*.fasl
+*.fas
+*.lib
+*.lx64fsl
+*.dx64fsl
