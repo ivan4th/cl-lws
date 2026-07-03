@@ -20,3 +20,15 @@
   "lws_mqtt_publish_param_t *p = param;
    p->dup = dup;
    p->retain = retain;")
+
+(defwrapper* mqtt-publish-param-retain
+  :int
+  ((param :pointer))
+  "lws_mqtt_publish_param_t *p = param;
+   return p->retain;")
+
+(defwrapper* mqtt-publish-param-dup
+  :int
+  ((param :pointer))
+  "lws_mqtt_publish_param_t *p = param;
+   return p->dup;")

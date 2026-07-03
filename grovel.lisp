@@ -449,3 +449,59 @@
          (num-topics "num_topics" :type uint32-t)
          (topic "topic" :type :pointer)
          (packet_id "packet_id" :type uint16-t))
+
+;;; --- raw / http / vhost support ---
+
+(constant (+lws-pre+ "LWS_PRE"))
+(constant (+lws-server-option-explicit-vhosts+ "LWS_SERVER_OPTION_EXPLICIT_VHOSTS"))
+(constant (+lws-server-option-adopt-apply-listen-accept-config+
+           "LWS_SERVER_OPTION_ADOPT_APPLY_LISTEN_ACCEPT_CONFIG"))
+(constant (+lws-to-kill-async+ "LWS_TO_KILL_ASYNC"))
+
+;; enum members can't be groveled with CONSTANT (the generated code
+;; checks for them with #ifdef)
+(cenum lws-mount-protocols
+       ((:lwsmpro-http "LWSMPRO_HTTP"))
+       ((:lwsmpro-file "LWSMPRO_FILE"))
+       ((:lwsmpro-callback "LWSMPRO_CALLBACK")))
+
+(cenum lws-adoption-type
+       ((:lws-adopt-raw-file-desc "LWS_ADOPT_RAW_FILE_DESC"))
+       ((:lws-adopt-http "LWS_ADOPT_HTTP"))
+       ((:lws-adopt-socket "LWS_ADOPT_SOCKET")))
+
+(ctype lws-filepos-t "lws_filepos_t")
+
+(cenum pending-timeout
+       ((:no-pending-timeout "NO_PENDING_TIMEOUT"))
+       ((:pending-timeout-http-content "PENDING_TIMEOUT_HTTP_CONTENT")))
+
+(cenum lws-write-protocol
+       ((:lws-write-http "LWS_WRITE_HTTP"))
+       ((:lws-write-http-final "LWS_WRITE_HTTP_FINAL")))
+
+(cenum lws-token-indexes
+       ((:wsi-token-get-uri "WSI_TOKEN_GET_URI"))
+       ((:wsi-token-post-uri "WSI_TOKEN_POST_URI"))
+       ((:wsi-token-options-uri "WSI_TOKEN_OPTIONS_URI"))
+       ((:wsi-token-origin "WSI_TOKEN_ORIGIN"))
+       ((:wsi-token-http-authorization "WSI_TOKEN_HTTP_AUTHORIZATION"))
+       ((:wsi-token-http-cookie "WSI_TOKEN_HTTP_COOKIE"))
+       ((:wsi-token-http-content-length "WSI_TOKEN_HTTP_CONTENT_LENGTH"))
+       ((:wsi-token-http-content-type "WSI_TOKEN_HTTP_CONTENT_TYPE"))
+       ((:wsi-token-http-uri-args "WSI_TOKEN_HTTP_URI_ARGS")))
+
+(cstruct lws-sorted-usec-list "lws_sorted_usec_list_t"
+         (list "list" :type (:struct lws-dll2))
+         (us "us" :type lws-usec-t)
+         (cb "cb" :type :pointer)
+         (latency-us "latency_us" :type uint32-t))
+
+(cstruct lws-http-mount "struct lws_http_mount"
+         (mount-next "mount_next" :type :pointer)
+         (mountpoint "mountpoint" :type :string)
+         (origin "origin" :type :string)
+         (def "def" :type :string)
+         (protocol "protocol" :type :string)
+         (origin-protocol "origin_protocol" :type :unsigned-char)
+         (mountpoint-len "mountpoint_len" :type :unsigned-char))
