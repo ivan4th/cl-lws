@@ -1,5 +1,29 @@
 (in-package :lws)
 
+;; lws_mqtt_*param bitfield accessors from libcsmodbus (see
+;; modbus/csmb-lws-glue.c); these used to be a cffi wrapper library,
+;; which forced an absolute-path .so reload from the ASDF cache in
+;; saved images.
+(cffi:defcfun ("csmb_glue_set_mqtt_client_connect_param_flags"
+               set-mqtt-client-connect-param-flags) :void
+  (param :pointer)
+  (clean-start :int))
+
+(cffi:defcfun ("csmb_glue_set_mqtt_publish_param_flags"
+               set-mqtt-publish-param-flags) :void
+  (param :pointer)
+  (dup :int)
+  (retain :int))
+
+(cffi:defcfun ("csmb_glue_mqtt_publish_param_retain"
+               mqtt-publish-param-retain) :int
+  (param :pointer))
+
+(cffi:defcfun ("csmb_glue_mqtt_publish_param_dup"
+               mqtt-publish-param-dup) :int
+  (param :pointer))
+
+
 ;;; MQTT client sessions.  Callback-only API, no promises: the caller
 ;;; owns reconnect policy (lws retry is used solely for keepalive ping
 ;;; validity).  Operations (subscribe / unsubscribe / publish) are

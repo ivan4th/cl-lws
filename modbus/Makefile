@@ -16,7 +16,7 @@ endif
 # pure-logic objects: no libwebsockets dependency, linked into tests
 PURE_OBJS = csmb-event.o csmb-codec.o csmb-image.o csmb-sched.o
 # lws-facing objects
-LWS_OBJS = csmb-lws.o csmb-master.o csmb-slave.o csmb-transport.o csmb-misc.o
+LWS_OBJS = csmb-lws.o csmb-master.o csmb-slave.o csmb-transport.o csmb-misc.o csmb-lws-glue.o
 
 OBJS = $(PURE_OBJS) $(LWS_OBJS)
 

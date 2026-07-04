@@ -29,7 +29,7 @@
    :error-output *error-output*))
 
 (defmethod asdf:perform ((op asdf:load-op) (component modbus-c-library))
-  (uiop:symbol-call :cffi '#:load-foreign-library (modbus-c-library-path)))
+  (uiop:symbol-call :lws '#:load-libcsmodbus (modbus-c-library-path)))
 
 (asdf:defsystem #:lws
   :description "libwebsockets bindings for Common Lisp."
@@ -37,7 +37,6 @@
   :components ((:file "package")
                (:file "libwebsockets")
                (:cffi-grovel-file "grovel")
-               (:cffi-wrapper-file "wrappers")
                (:file "cffi")
                (:file "registry")
                (:file "context")
