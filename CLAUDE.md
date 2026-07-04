@@ -160,3 +160,20 @@ marshal cross-thread work through `lws:defer`.
   no valid frame in between, the master drops the connection
   (`CSMB_CERR_TIMEOUT`) and reconnects; the counter resets on any valid
   frame.
+
+### Master publish / staleness semantics
+
+- **Delayed staleness (per span)**: a span goes `:stale` only after its
+  unit's stale-timeout elapses without a *successful* read of that span —
+  driven by a periodic sweep (`csmb_sched_staleness_sweep`, ~min-stale/4).
+  A transient exception or timeout shorter than the timeout causes no
+  state change, and a sibling span that still reads fine stays online even
+  when another span on the same unit keeps excepting (the unit stays
+  online as long as it answers anything).
+- **Force-republish after writes**: when a write op completes (success or
+  failure) every span overlapping it is force-published on its next
+  successful read, so the model reconverges to the device-actual value
+  even if it equals the pre-write image (the device may clamp/ignore the
+  write, or the op may have timed out).
+- **CONN_STATE dedup**: `CONNECTING` and `OFFLINE` are emitted at most once
+  per outage (not per reconnect attempt); `ONLINE` on each recovery.

@@ -474,7 +474,9 @@ total-len); else NIL."
                                                    :heartbeat 0.03
                                                    :response-timeout 0.5)))
                    (setf (rec-master rec) master)
-                   (modbus-add-unit master 1 :stale-timeout 3.0)
+                   ;; short stale-timeout so the delayed exception-stale
+                   ;; (phase 4) resolves quickly
+                   (modbus-add-unit master 1 :stale-timeout 1.0)
                    (setf (rec-h1 rec) (modbus-subscribe master 1 :holding 10 5)
                          (rec-h2 rec) (modbus-subscribe master 1 :holding 100 5)
                          (rec-c1 rec) (modbus-subscribe master 1 :coil 0 16
@@ -543,8 +545,8 @@ total-len); else NIL."
                (snap! r h1)
                (setf (rec-op r)
                      (modbus-write (rec-master r) 1
-                                          '((:holding 10 (7000 7001))
-                                            (:holding 12 (8000)))))))
+                                   '((:holding 10 (7000 7001))
+                                     (:holding 12 (8000)))))))
      ;; 1: op completes ok, slave saw both writes in order, master read back
      (list #'(lambda (r)
                (and (ev-any r :write-done
@@ -556,10 +558,24 @@ total-len); else NIL."
                                      (equalp (third e)
                                              #(7000 7001 8000 1003 1004)))))))
            #'(lambda (r)
+               ;; write the SAME values again: the read-back is unchanged,
+               ;; but force-republish (fix B) must still surface an update
+               (snap! r h1)
+               (setf (rec-op r)
+                     (modbus-write (rec-master r) 1
+                                   '((:holding 10 (7000 7001))
+                                     (:holding 12 (8000)))))))
+     ;; 2: the unchanged write republishes h1 anyway (force after write)
+     (list #'(lambda (r)
+               (and (ev-any r :write-done
+                            #'(lambda (e) (and (eql (second e) (rec-op r))
+                                               (eq (third e) :ok))))
+                    (> (uc r h1) (base r h1))))
+           #'(lambda (r)
                (snap! r h2)
                (modbus-set-values (rec-slave r) 1 :holding 100
                                   '(111 222 333 444 555))))
-     ;; 2: the changed block republishes
+     ;; 3: the changed block republishes
      (list #'(lambda (r) (> (uc r h2) (base r h2)))
            #'(lambda (r) (declare (ignore r)))))))
 
@@ -614,9 +630,13 @@ total-len); else NIL."
       (is (ev-any rec :write-done
                   #'(lambda (e) (and (eql (second e) (rec-op rec))
                                      (eq (third e) :ok)))))
-      (is (ev-any rec :span-update
-                  #'(lambda (e) (and (eql (second e) h1)
-                                     (equalp (third e) #(7000 7001 8000 1003 1004))))))
+      ;; force-republish (fix B): the two writes of the same value each
+      ;; produced a fresh h1 update, even though the read-back was unchanged
+      (is (>= (count-if #'(lambda (e)
+                            (and (eq (first e) :span-update) (eql (second e) h1)
+                                 (equalp (third e) #(7000 7001 8000 1003 1004))))
+                        events)
+              2))
       ;; change detection surfaced the new holding-100 values
       (is (ev-any rec :span-update
                   #'(lambda (e) (and (eql (second e) h2)

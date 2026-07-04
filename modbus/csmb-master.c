@@ -17,13 +17,6 @@
 #define CSMB_BACKOFF_MAX_MS 8000
 #define CSMB_DEADPEER_TIMEOUTS 5   /* consecutive timeouts -> drop the conn */
 
-typedef struct csmb_stale_timer {
-    struct lws_sorted_usec_list sul;
-    csmb_master *m;
-    uint8_t unit;
-    int armed;
-} csmb_stale_timer;
-
 struct csmb_master {
     csmb_engine engine;              /* MUST be first */
     struct lws_vhost *client_vhost;
@@ -33,13 +26,15 @@ struct csmb_master {
 
     csmb_conn *conn;                 /* the single outgoing connection */
     int conn_state;                  /* csmb_conn_state_t */
+    int conn_announced;              /* CONNECTING emitted this outage */
+    int offline_announced;           /* OFFLINE emitted this outage */
 
     struct lws_sorted_usec_list reconnect_sul;   /* also the initial connect */
     struct lws_sorted_usec_list heartbeat_sul;
     struct lws_sorted_usec_list resp_sul;
     struct lws_sorted_usec_list pace_sul;
     struct lws_sorted_usec_list t35_sul;         /* serial RTU idle-gap resync */
-    csmb_stale_timer stale[256];
+    struct lws_sorted_usec_list sweep_sul;       /* periodic staleness sweep */
 
     uint32_t backoff_ms;
     uint32_t heartbeat_ms;
@@ -78,43 +73,36 @@ static void emit_conn_state(csmb_master *m, uint8_t state, uint8_t cerr)
     csmb_event_add(&m->engine, &ev, NULL, 0);
 }
 
-/* ---- per-unit stale timers ---- */
+/* ---- periodic staleness sweep ---- */
 
-static void stale_cb(struct lws_sorted_usec_list *sul)
+static void sweep_cb(struct lws_sorted_usec_list *sul)
 {
-    csmb_stale_timer *st = lws_container_of(sul, csmb_stale_timer, sul);
-    csmb_master *m = st->m;
+    csmb_master *m = lws_container_of(sul, csmb_master, sweep_sul);
+    uint32_t min_ms, period_ms;
 
-    st->armed = 0;
-    csmb_sched_mark_unit_stale(&m->engine, &m->sched, st->unit);
+    csmb_sched_staleness_sweep(&m->engine, &m->sched, lws_now_usecs());
+    /* reschedule at ~ min-stale-timeout / 4, clamped to 50ms..1s */
+    min_ms = csmb_sched_min_stale_ms(&m->sched);
+    period_ms = min_ms / 4;
+    if (period_ms < 50)
+        period_ms = 50;
+    else if (period_ms > 1000)
+        period_ms = 1000;
+    lws_sul_schedule(m->engine.cx, 0, &m->sweep_sul, sweep_cb,
+                     (lws_usec_t)period_ms * 1000);
     csmb_event_flush(&m->engine);
 }
 
-static void reset_stale_timer(csmb_master *m, uint8_t unit)
+static void arm_sweep(csmb_master *m)
 {
-    csmb_sunit *u = csmb_sched_find_unit(&m->sched, unit);
-    uint32_t to = u ? u->stale_timeout_ms : 20000;
+    uint32_t period_ms = csmb_sched_min_stale_ms(&m->sched) / 4;
 
-    m->stale[unit].armed = 1;
-    lws_sul_schedule(m->engine.cx, 0, &m->stale[unit].sul, stale_cb,
-                     (lws_usec_t)to * 1000);
-}
-
-static void arm_stale_if_needed(csmb_master *m, uint8_t unit)
-{
-    if (!m->stale[unit].armed)
-        reset_stale_timer(m, unit);
-}
-
-static void cancel_all_stale(csmb_master *m)
-{
-    int i;
-
-    for (i = 0; i < 256; i++)
-        if (m->stale[i].armed) {
-            lws_sul_cancel(&m->stale[i].sul);
-            m->stale[i].armed = 0;
-        }
+    if (period_ms < 50)
+        period_ms = 50;
+    else if (period_ms > 1000)
+        period_ms = 1000;
+    lws_sul_schedule(m->engine.cx, 0, &m->sweep_sul, sweep_cb,
+                     (lws_usec_t)period_ms * 1000);
 }
 
 static void master_t35_cb(struct lws_sorted_usec_list *sul)
@@ -175,7 +163,6 @@ static void master_pump(csmb_master *m)
         csmb_conn_send(m->conn, frame, (size_t)flen);
     }
 
-    arm_stale_if_needed(m, m->pending.unit);
     lws_sul_schedule(m->engine.cx, 0, &m->resp_sul, resp_cb,
                      (lws_usec_t)m->response_timeout_ms * 1000);
 
@@ -256,7 +243,10 @@ static void start_connect(csmb_master *m)
     if (m->engine.destroyed)
         return;
     m->conn_state = CSMB_CONN_CONNECTING;
-    emit_conn_state(m, CSMB_CONN_CONNECTING, CSMB_CERR_NONE);
+    if (!m->conn_announced) {   /* CONNECTING once per outage, not per retry */
+        emit_conn_state(m, CSMB_CONN_CONNECTING, CSMB_CERR_NONE);
+        m->conn_announced = 1;
+    }
 
     if (m->tr.kind == CSMB_TR_TCP) {
         m->conn = csmb_transport_connect(m->engine.cx, m->client_vhost, &m->tr, m);
@@ -303,11 +293,14 @@ static void schedule_reconnect(csmb_master *m)
 
 static void master_go_down(csmb_master *m, uint8_t cerr)
 {
-    if (m->conn_state == CSMB_CONN_OFFLINE)
-        return;
+    /* announce OFFLINE and tear the scheduler down once per outage; retry
+     * failures within the same outage just re-cancel timers and reschedule */
+    if (!m->offline_announced) {
+        emit_conn_state(m, CSMB_CONN_OFFLINE, cerr);
+        m->offline_announced = 1;
+        csmb_sched_connection_down(&m->engine, &m->sched);
+    }
     m->conn_state = CSMB_CONN_OFFLINE;
-    emit_conn_state(m, CSMB_CONN_OFFLINE, cerr);
-    csmb_sched_connection_down(&m->engine, &m->sched);
     m->in_flight = 0;
     m->round_active = 0;
     m->pace_until = 0;
@@ -316,7 +309,7 @@ static void master_go_down(csmb_master *m, uint8_t cerr)
     lws_sul_cancel(&m->pace_sul);
     lws_sul_cancel(&m->heartbeat_sul);
     lws_sul_cancel(&m->t35_sul);
-    cancel_all_stale(m);
+    lws_sul_cancel(&m->sweep_sul);
     schedule_reconnect(m);
 }
 
@@ -324,11 +317,14 @@ static void master_go_online(csmb_master *m)
 {
     m->conn_state = CSMB_CONN_ONLINE;
     emit_conn_state(m, CSMB_CONN_ONLINE, CSMB_CERR_NONE);
+    m->conn_announced = 0;      /* the outage is over */
+    m->offline_announced = 0;
     m->backoff_ms = 0;
     m->timeout_streak = 0;
     csmb_sched_connection_up(&m->sched);
     lws_sul_schedule(m->engine.cx, 0, &m->heartbeat_sul, heartbeat_cb,
                      (lws_usec_t)m->heartbeat_ms * 1000);
+    arm_sweep(m);
     m->round_active = 1;
     csmb_sched_start_round(&m->engine, &m->sched);
     master_pump(m);
@@ -420,7 +416,6 @@ int csmb_master_on_rx(csmb_master *m, const uint8_t *buf, size_t len)
             if (csmb_decode_response(r_pdu, r_plen, m->pending.fc, &r) >= 0) {
                 lws_sul_cancel(&m->resp_sul);
                 m->in_flight = 0;
-                reset_stale_timer(m, m->pending.unit);
                 csmb_sched_on_response(&m->engine, &m->sched, &m->pending, &r,
                                        lws_now_usecs());
                 processed = 1;
@@ -448,7 +443,6 @@ csmb_master *csmb_master_create(struct lws_context *cx,
                                 csmb_notify_cb notify, void *opaque)
 {
     csmb_master *m;
-    int i;
 
     if (tr->kind != CSMB_TR_TCP && tr->kind != CSMB_TR_SERIAL &&
         tr->kind != CSMB_TR_FD)
@@ -475,10 +469,6 @@ csmb_master *csmb_master_create(struct lws_context *cx,
     m->response_timeout_ms = 1000;
     m->conn_state = CSMB_CONN_OFFLINE;
     m->next_tid = 1;
-    for (i = 0; i < 256; i++) {
-        m->stale[i].m = m;
-        m->stale[i].unit = (uint8_t)i;
-    }
     /* Kick off the first connect on the next loop iteration, after the
      * Lisp side has stored the engine pointer (so the connecting event's
      * flush finds a fully-wired object). */
@@ -496,7 +486,7 @@ void csmb_master_destroy(csmb_master *m)
     lws_sul_cancel(&m->resp_sul);
     lws_sul_cancel(&m->pace_sul);
     lws_sul_cancel(&m->t35_sul);
-    cancel_all_stale(m);
+    lws_sul_cancel(&m->sweep_sul);
     if (m->conn) {
         m->conn->owner = NULL;
         if (m->conn->wsi)

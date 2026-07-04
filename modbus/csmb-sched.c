@@ -713,6 +713,28 @@ static void extract_span(int rt, const csmb_response *r, uint16_t rd_start,
     }
 }
 
+/* On write-op completion (success OR failure) force the next successful
+ * read of every overlapping span to publish, so the model reconverges to
+ * the device-actual value even if it equals the pre-write image (the
+ * device may clamp/ignore the write, or the op may have timed out). */
+static void force_overlapping_spans(csmb_sched *sc, const csmb_write_op *op)
+{
+    csmb_span *sp;
+    int i;
+
+    for (sp = sc->spans; sp; sp = sp->next) {
+        if (sp->unit != op->unit)
+            continue;
+        for (i = 0; i < op->nreqs; i++)
+            if (op->reqs[i].reg_type == sp->reg_type &&
+                ranges_intersect(op->reqs[i].start, op->reqs[i].count,
+                                 sp->start, sp->count)) {
+                sp->force = 1;
+                break;
+            }
+    }
+}
+
 static void handle_write_response(csmb_engine *e, csmb_sched *sc,
                                   const csmb_pending *p, const csmb_response *r)
 {
@@ -727,6 +749,7 @@ static void handle_write_response(csmb_engine *e, csmb_sched *sc,
     if (r->exception) {
         emit_write_done(e, op->op_id, op->unit, CSMB_WR_EXCEPTION,
                         r->exception, (uint8_t)op->cur);
+        force_overlapping_spans(sc, op);
         pop_write_op(sc);
         return;
     }
@@ -734,6 +757,7 @@ static void handle_write_response(csmb_engine *e, csmb_sched *sc,
         if (r->start != wr->start || r->count_or_value != wr->verify) {
             emit_write_done(e, op->op_id, op->unit, CSMB_WR_VERIFY_FAILED,
                             0, (uint8_t)op->cur);
+            force_overlapping_spans(sc, op);
             pop_write_op(sc);
             return;
         }
@@ -741,6 +765,7 @@ static void handle_write_response(csmb_engine *e, csmb_sched *sc,
     op->cur++;
     if (op->cur >= op->nreqs) {
         emit_write_done(e, op->op_id, op->unit, CSMB_WR_OK, 0, 0);
+        force_overlapping_spans(sc, op);
         pop_write_op(sc);
     }
 }
@@ -752,8 +777,10 @@ void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
     csmb_sunit *u = csmb_sched_find_unit(sc, p->unit);
     csmb_span *sp;
 
-    /* the unit answered: it is online, and no longer failing */
+    /* the unit answered (data OR exception): mark it online and record
+     * the response time (for the unit-offline sweep) */
     if (u) {
+        u->last_response = now;
         if (!u->online) {
             u->online = 1;
             emit_unit_state(e, u->unit, CSMB_ST_ONLINE);
@@ -772,23 +799,11 @@ void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
         return;
     }
 
-    /* read */
+    /* read exception: the unit is alive but this read yielded no data, so
+     * the covered spans' last_ok simply does not advance — they go stale
+     * only if the exceptions persist past the stale-timeout (the sweep) */
     if (r->exception) {
-        /* the unit answered (it stays online) but the read failed: the
-         * spans this read covers have no fresh data and go stale */
         emit_log_rl(e, sc, p->unit, CSMB_LOG_EXCEPTION, p->fc, r->exception, now);
-        for (sp = sc->spans; sp; sp = sp->next) {
-            if (sp->unit != p->unit || sp->reg_type != p->reg_type)
-                continue;
-            if (sp->start < p->start ||
-                (uint32_t)sp->start + sp->count > (uint32_t)p->start + p->count)
-                continue;
-            if (sp->state != CSMB_ST_STALE) {
-                sp->state = CSMB_ST_STALE;
-                sp->have_values = 0;
-                emit_span_state(e, sp, CSMB_ST_STALE);
-            }
-        }
         return;
     }
 
@@ -805,6 +820,7 @@ void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
         if (!response_covers(r, sp->reg_type, p->start, sp))
             continue;   /* short response */
 
+        sp->last_ok = now;   /* a successful read of THIS span */
         extract_span(sp->reg_type, r, p->start, sp, vals);
         if (sp->state != CSMB_ST_ONLINE) {
             sp->state = CSMB_ST_ONLINE;
@@ -830,6 +846,7 @@ void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
         if (op && op->op_id == p->op_id) {
             emit_write_done(e, op->op_id, op->unit, (uint8_t)wr_status, 0,
                             (uint8_t)op->cur);
+            force_overlapping_spans(sc, op);
             pop_write_op(sc);
         }
     } else {
@@ -841,22 +858,51 @@ void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
     }
 }
 
-void csmb_sched_mark_unit_stale(csmb_engine *e, csmb_sched *sc, uint8_t unit)
+uint32_t csmb_sched_min_stale_ms(csmb_sched *sc)
 {
-    csmb_sunit *u = csmb_sched_find_unit(sc, unit);
+    csmb_sunit *u;
+    uint32_t min = 0;
+
+    for (u = sc->units; u; u = u->next)
+        if (min == 0 || u->stale_timeout_ms < min)
+            min = u->stale_timeout_ms;
+    return min ? min : 20000;
+}
+
+void csmb_sched_staleness_sweep(csmb_engine *e, csmb_sched *sc, csmb_usec_t now)
+{
+    csmb_sunit *u;
     csmb_span *sp;
 
-    if (!u)
-        return;
-    if (u->online) {
-        emit_unit_state(e, unit, CSMB_ST_OFFLINE);
-        u->online = 0;
+    /* a unit silent past its stale-timeout goes offline */
+    for (u = sc->units; u; u = u->next) {
+        csmb_usec_t to = (csmb_usec_t)u->stale_timeout_ms * 1000;
+
+        if (u->online && u->last_response != 0 && now - u->last_response > to) {
+            emit_unit_state(e, u->unit, CSMB_ST_OFFLINE);
+            u->online = 0;
+        }
     }
-    for (sp = sc->spans; sp; sp = sp->next)
-        if (sp->unit == unit && sp->state != CSMB_ST_STALE) {
+
+    /* a span not read successfully within its unit's stale-timeout goes
+     * stale; never-read spans are baselined to the first sweep (~ subscribe
+     * / connect time) so they, too, stale after the timeout */
+    for (sp = sc->spans; sp; sp = sp->next) {
+        csmb_sunit *su = csmb_sched_find_unit(sc, sp->unit);
+        csmb_usec_t to = (csmb_usec_t)(su ? su->stale_timeout_ms : 20000) * 1000;
+
+        if (sp->last_ok == 0) {
+            sp->last_ok = now;
+            continue;
+        }
+        if (now - sp->last_ok > to &&
+            sp->state != CSMB_ST_STALE && sp->state != CSMB_ST_OFFLINE &&
+            sp->state != CSMB_ST_UNCOVERED) {
             sp->state = CSMB_ST_STALE;
+            sp->have_values = 0;
             emit_span_state(e, sp, CSMB_ST_STALE);
         }
+    }
 }
 
 int csmb_sched_set_unit_enabled(csmb_engine *e, csmb_sched *sc, uint8_t unit,
@@ -905,12 +951,16 @@ void csmb_sched_connection_down(csmb_engine *e, csmb_sched *sc)
         }
         u->failing = 0;
     }
-    for (sp = sc->spans; sp; sp = sp->next)
+    for (sp = sc->spans; sp; sp = sp->next) {
         if (sp->state != CSMB_ST_OFFLINE) {
             sp->state = CSMB_ST_OFFLINE;
             sp->have_values = 0;
             emit_span_state(e, sp, CSMB_ST_OFFLINE);
         }
+        sp->last_ok = 0;
+    }
+    for (u = sc->units; u; u = u->next)
+        u->last_response = 0;
     sc->prog_len = sc->prog_idx = 0;
 }
 
@@ -922,10 +972,12 @@ void csmb_sched_connection_up(csmb_sched *sc)
     for (sp = sc->spans; sp; sp = sp->next) {
         sp->have_values = 0;
         sp->state = 0;
+        sp->last_ok = 0;   /* re-baseline on (re)connect */
     }
     for (u = sc->units; u; u = u->next) {
         u->online = 0;
         u->failing = 0;
+        u->last_response = 0;
     }
     sc->prog_len = sc->prog_idx = 0;
 }

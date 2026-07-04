@@ -372,7 +372,8 @@ typedef struct csmb_span {
     uint32_t flags;        /* CSMB_SPAN_ALWAYS */
     uint16_t *values;      /* last published values (count entries), or NULL */
     int      have_values;  /* published at least once since the last clear */
-    int      force;        /* refresh_span: publish the next read unconditionally */
+    int      force;        /* publish the next read unconditionally (refresh / post-write) */
+    csmb_usec_t last_ok;   /* last successful read of THIS span (0 = never) */
     uint8_t  state;        /* last emitted csmb_state_t, 0 = none */
 } csmb_span;
 
@@ -409,6 +410,7 @@ typedef struct csmb_sunit {
     size_t   poll_seq_n[CSMB_NUM_REG_TYPES];
     int      online;       /* has answered since the last stale/offline */
     int      failing;      /* last request to it failed (deprioritise) */
+    csmb_usec_t last_response;    /* last time it answered anything (0 = never) */
     csmb_usec_t last_log_us[3];  /* last LOG emit time per csmb_log_kind (1..2) */
 } csmb_sunit;
 
@@ -498,9 +500,15 @@ void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
                                   const csmb_pending *p, int wr_status,
                                   csmb_usec_t now);
 
-/* The per-unit stale timer fired: the unit's spans go STALE and it goes
- * offline (values cleared so recovery republishes). */
-void csmb_sched_mark_unit_stale(csmb_engine *e, csmb_sched *sc, uint8_t unit);
+/* Periodic staleness sweep (driven by the master at ~min-stale/4): a span
+ * that has not been read successfully within its unit's stale-timeout goes
+ * STALE (values cleared); a unit silent for its stale-timeout goes OFFLINE.
+ * Transient exceptions/timeouts shorter than the timeout cause no change. */
+void csmb_sched_staleness_sweep(csmb_engine *e, csmb_sched *sc, csmb_usec_t now);
+
+/* Smallest configured unit stale-timeout in ms (default 20000 if none) —
+ * used to pick the sweep period. */
+uint32_t csmb_sched_min_stale_ms(csmb_sched *sc);
 
 /* Enable/disable polling of a unit; disabling fails its queued writes
  * with CSMB_WR_UNIT_DISABLED and staled its spans, enabling clears their

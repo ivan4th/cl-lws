@@ -588,34 +588,74 @@ static void test_enable_disable(void)
     csmb_engine_free(&e);
 }
 
-/* ---- staleness & connection down/up ---- */
+/* did any captured SPAN_STATE for span ID carry STATE? */
+static int had_span_state(int32_t id, uint8_t state)
+{
+    int i;
+
+    for (i = 0; i < ncap; i++)
+        if (cap[i].type == CSMB_EV_SPAN_STATE && cap[i].span_id == id &&
+            cap[i].state == state)
+            return 1;
+    return 0;
+}
+
+/* did any captured UNIT_STATE carry STATE? */
+static int had_unit_state(uint8_t state)
+{
+    int i;
+
+    for (i = 0; i < ncap; i++)
+        if (cap[i].type == CSMB_EV_UNIT_STATE && cap[i].state == state)
+            return 1;
+    return 0;
+}
+
+/* ---- staleness (sweep) & connection down/up ---- */
 
 static void test_stale_and_connection(void)
 {
     csmb_sched sc;
     csmb_engine e;
     csmb_pending p;
+    csmb_response r;
     csmb_write_spec specs[1];
     uint16_t w[2] = { 5, 6 };
     uint16_t nine[1] = { 9 };
     struct evrec *ev;
+    csmb_usec_t t = 1000000;   /* 1s; the unit's stale-timeout is 1s */
 
     csmb_sched_init(&sc);
     csmb_engine_init(&e, NULL, NULL, NULL);
-    csmb_sched_add_unit(&sc, 1, 0, 20000, 0);
+    csmb_sched_add_unit(&sc, 1, 0, 1000, 0);
     csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 10, 2, 0);
 
-    one_read(&e, &sc, CSMB_HOLDING, w, 2);
+    /* first read: online + value */
+    csmb_sched_start_round(&e, &sc);
+    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
+    r = resp_read(CSMB_HOLDING, w, 2);
+    csmb_sched_on_response(&e, &sc, &p, &r, t);
     capture(&e);
+    TCHECK_EQ(nth_type(CSMB_EV_UNIT_STATE, 0)->state, CSMB_ST_ONLINE);
 
-    /* stale timer fired */
-    csmb_sched_mark_unit_stale(&e, &sc, 1);
+    /* sweep before the timeout: nothing */
+    csmb_sched_staleness_sweep(&e, &sc, t + 500000);
     capture(&e);
+    TCHECK_EQ(ncap, 0);
+
+    /* sweep past the timeout: unit offline + span stale */
+    csmb_sched_staleness_sweep(&e, &sc, t + 2000000);
+    capture(&e);
+    TCHECK_EQ(count_type(CSMB_EV_UNIT_STATE), 1);
     TCHECK_EQ(nth_type(CSMB_EV_UNIT_STATE, 0)->state, CSMB_ST_OFFLINE);
+    TCHECK_EQ(count_type(CSMB_EV_SPAN_STATE), 1);
     TCHECK_EQ(nth_type(CSMB_EV_SPAN_STATE, 0)->state, CSMB_ST_STALE);
 
     /* recovery republishes */
-    one_read(&e, &sc, CSMB_HOLDING, w, 2);
+    csmb_sched_start_round(&e, &sc);
+    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
+    r = resp_read(CSMB_HOLDING, w, 2);
+    csmb_sched_on_response(&e, &sc, &p, &r, t + 3000000);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_UNIT_STATE, 0)->state, CSMB_ST_ONLINE);
     TCHECK_EQ(nth_type(CSMB_EV_SPAN_STATE, 0)->state, CSMB_ST_ONLINE);
@@ -636,7 +676,10 @@ static void test_stale_and_connection(void)
     csmb_sched_connection_up(&sc);
     capture(&e);
     TCHECK_EQ(ncap, 0);
-    one_read(&e, &sc, CSMB_HOLDING, w, 2);
+    csmb_sched_start_round(&e, &sc);
+    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
+    r = resp_read(CSMB_HOLDING, w, 2);
+    csmb_sched_on_response(&e, &sc, &p, &r, t + 4000000);
     capture(&e);
     TCHECK_EQ(count_type(CSMB_EV_SPAN_UPDATE), 1);
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_NONE);
@@ -645,39 +688,46 @@ static void test_stale_and_connection(void)
     csmb_engine_free(&e);
 }
 
-/* a read that draws an exception staled the covered span but the unit
- * stays online (it did answer) */
-static void test_read_exception(void)
+/* Delayed exception staleness: a span that always draws exceptions stales
+ * only after the stale-timeout (not immediately), a sibling span that
+ * still reads fine stays online, and the unit stays online because it
+ * keeps answering (with exceptions). */
+static void test_exception_sibling(void)
 {
     csmb_sched sc;
     csmb_engine e;
     csmb_pending p;
     csmb_response r;
+    int32_t good, bad;
     uint16_t w[2] = { 5, 6 };
-    struct evrec *ev;
+    csmb_usec_t t;
 
     csmb_sched_init(&sc);
     csmb_engine_init(&e, NULL, NULL, NULL);
-    csmb_sched_add_unit(&sc, 1, 0, 20000, 0);
-    csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 10, 2, 0);
+    csmb_sched_add_unit(&sc, 1, 0, 1000, 0);   /* 1s stale-timeout */
+    good = csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 10, 2, 0);
+    bad  = csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 100, 2, 0);
+    TCHECK(good > 0 && bad > 0);
 
-    one_read(&e, &sc, CSMB_HOLDING, w, 2);   /* online + value */
-    capture(&e);
+    /* poll every 200ms from 1s to 3s: good reads OK, bad always excepts */
+    for (t = 1000000; t <= 3000000; t += 200000) {
+        csmb_sched_start_round(&e, &sc);
+        while (csmb_sched_pick(&sc, &p) == CSMB_PICK_READ) {
+            if (p.start == 10)
+                r = resp_read(CSMB_HOLDING, w, 2);
+            else
+                r = resp_exc(rd_fc(CSMB_HOLDING), CSMB_EXC_ILLEGAL_ADDRESS);
+            csmb_sched_on_response(&e, &sc, &p, &r, t);
+        }
+        csmb_sched_staleness_sweep(&e, &sc, t);
+    }
+    capture(&e);   /* the whole run's events */
 
-    csmb_sched_start_round(&e, &sc);
-    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
-    r = resp_exc(rd_fc(CSMB_HOLDING), CSMB_EXC_ILLEGAL_ADDRESS);
-    csmb_sched_on_response(&e, &sc, &p, &r, 0);
-    capture(&e);
-    /* unit stays online (no UNIT_STATE), span goes stale, log emitted */
-    TCHECK_EQ(count_type(CSMB_EV_UNIT_STATE), 0);
-    ev = nth_type(CSMB_EV_SPAN_STATE, 0);
-    TCHECK(ev != NULL);
-    TCHECK_EQ(ev->state, CSMB_ST_STALE);
-    ev = nth_type(CSMB_EV_LOG, 0);
-    TCHECK(ev != NULL);
-    TCHECK_EQ(ev->state, CSMB_LOG_EXCEPTION);
-    TCHECK_EQ(ev->exception, CSMB_EXC_ILLEGAL_ADDRESS);
+    TCHECK(had_span_state(good, CSMB_ST_ONLINE));   /* good came online */
+    TCHECK(!had_span_state(good, CSMB_ST_STALE));    /* and stayed online */
+    TCHECK(had_span_state(bad, CSMB_ST_STALE));       /* bad eventually staled */
+    TCHECK(!had_unit_state(CSMB_ST_OFFLINE));         /* unit never went offline */
+    TCHECK(count_type(CSMB_EV_LOG) >= 1);             /* an exception was logged */
 
     csmb_sched_free(&sc);
     csmb_engine_free(&e);
@@ -686,4 +736,4 @@ static void test_read_exception(void)
 TEST_MAIN(test_bunch, test_subscribe, test_change_detection,
           test_always_and_coils, test_write_ok, test_write_errors,
           test_write_preempt_and_hold, test_poll_seq_uncovered,
-          test_enable_disable, test_stale_and_connection, test_read_exception)
+          test_enable_disable, test_stale_and_connection, test_exception_sibling)
