@@ -17,3 +17,10 @@ lws-wrappers.so
 *.lib
 *.lx64fsl
 *.dx64fsl
+modbus/*.o
+modbus/libcsmodbus.*
+modbus/tests/test-event
+modbus/tests/test-codec
+modbus/tests/test-sched
+modbus/tests/test-image
+modbus/tests/*.dSYM/
