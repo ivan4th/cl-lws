@@ -325,36 +325,41 @@ total-len); else NIL."
   (some #'(lambda (e) (and (eq (first e) type) (funcall test e)))
         (rec-events rec)))
 
-(defmethod on-modbus-span-update ((h mb-master-recorder) master span-id unit
-                                  reg-type start values)
+;;; recorded event shapes (type first):
+;;;   (:span-update span-id values) (:span-state span-id state)
+;;;   (:unit-state unit state) (:write-done op-id status exception req-index)
+;;;   (:conn-state state error) (:log kind unit fc exception)
+
+(defmethod on-modbus-span-update ((h mb-master-recorder) master span-id values)
   (declare (ignore master))
-  (push (list :span-update span-id unit reg-type start values) (rec-events h))
+  (push (list :span-update span-id values) (rec-events h))
   (incf (gethash span-id (rec-ucounts h) 0)))
 
-(defmethod on-modbus-span-state ((h mb-master-recorder) master span-id unit
-                                 reg-type start count state)
+(defmethod on-modbus-span-state ((h mb-master-recorder) master span-id state)
   (declare (ignore master))
-  (push (list :span-state span-id unit reg-type start count state) (rec-events h)))
+  (push (list :span-state span-id state) (rec-events h)))
 
 (defmethod on-modbus-unit-state ((h mb-master-recorder) master unit state)
   (declare (ignore master))
   (push (list :unit-state unit state) (rec-events h)))
 
-(defmethod on-modbus-write-done ((h mb-master-recorder) master op-id unit
-                                 status exception aux)
+(defmethod on-modbus-write-complete ((h mb-master-recorder) master op-id status
+                                     &key exception request-index)
   (declare (ignore master))
-  (push (list :write-done op-id unit status exception aux) (rec-events h)))
+  (push (list :write-done op-id status exception request-index) (rec-events h)))
 
-(defmethod on-modbus-conn-state ((h mb-master-recorder) master state error)
+(defmethod on-modbus-connection-state ((h mb-master-recorder) master state
+                                       &key error)
   (declare (ignore master))
   (push (list :conn-state state error) (rec-events h))
   (case state
     (:online  (setf (rec-online h) t) (incf (rec-online-count h)))
     (:offline (incf (rec-offline-count h)))))
 
-(defmethod on-modbus-log ((h mb-master-recorder) master unit kind fc exception)
+(defmethod on-modbus-log ((h mb-master-recorder) master kind unit
+                          &key fc exception)
   (declare (ignore master))
-  (push (list :log unit kind fc exception) (rec-events h)))
+  (push (list :log kind unit fc exception) (rec-events h)))
 
 (defun build-master-phases (rec)
   (let ((h1 (rec-h1 rec)) (h2 (rec-h2 rec)) (c1 (rec-c1 rec)))
@@ -364,16 +369,16 @@ total-len); else NIL."
                               (>= (uc r h1) 1) (>= (uc r h2) 1) (>= (uc r c1) 1)))
            #'(lambda (r)
                (setf (rec-op r)
-                     (modbus-master-write (rec-master r) 1
+                     (modbus-write (rec-master r) 1
                                           '((:holding 10 (7000 7001 7002)))))))
      ;; 1: write completes and the held read-back publishes the new value
      (list #'(lambda (r)
                (and (ev-any r :write-done
                             #'(lambda (e) (and (eql (second e) (rec-op r))
-                                               (eq (fourth e) :ok))))
+                                               (eq (third e) :ok))))
                     (ev-any r :span-update
                             #'(lambda (e) (and (eql (second e) h1)
-                                               (equalp (sixth e)
+                                               (equalp (third e)
                                                        #(7000 7001 7002 1003 1004)))))))
            #'(lambda (r)
                (snap! r h2)
@@ -381,35 +386,35 @@ total-len); else NIL."
                                   '(111 222 333 444 555))))
      ;; 2: change detection republishes the changed holding block
      (list #'(lambda (r) (> (uc r h2) (base r h2)))
-           #'(lambda (r) (snap! r h1) (modbus-master-refresh-span (rec-master r) h1)))
+           #'(lambda (r) (snap! r h1) (modbus-refresh-span (rec-master r) h1)))
      ;; 3: refresh-span republishes the unchanged block
      (list #'(lambda (r) (> (uc r h1) (base r h1)))
            #'(lambda (r)
                (setf (rec-he r)
-                     (modbus-master-subscribe (rec-master r) 1 :holding 50 3))))
+                     (modbus-subscribe (rec-master r) 1 :holding 50 3))))
      ;; 4: an unregistered read draws an exception -> span stale + log
      (list #'(lambda (r)
                (and (rec-he r)
                     (ev-any r :span-state
                             #'(lambda (e) (and (eql (second e) (rec-he r))
-                                               (eq (seventh e) :stale))))
-                    (ev-any r :log #'(lambda (e) (eq (third e) :exception)))))
+                                               (eq (third e) :stale))))
+                    (ev-any r :log #'(lambda (e) (eq (second e) :exception)))))
            #'(lambda (r)
-               (modbus-master-set-poll-seq (rec-master r) 1 :holding '((10 5)))))
+               (modbus-set-poll-seq (rec-master r) 1 :holding '((10 . 5)))))
      ;; 5: poll-seq leaves h2 uncovered
      (list #'(lambda (r)
                (ev-any r :span-state
                        #'(lambda (e) (and (eql (second e) h2)
-                                          (eq (seventh e) :uncovered)))))
+                                          (eq (third e) :uncovered)))))
            #'(lambda (r)
-               (modbus-master-set-poll-seq (rec-master r) 1 :holding '())
-               (modbus-master-set-unit-enabled (rec-master r) 1 nil)))
+               (modbus-set-poll-seq (rec-master r) 1 :holding '())
+               (modbus-set-unit-enabled (rec-master r) 1 nil)))
      ;; 6: disabling takes the unit offline
      (list #'(lambda (r)
                (ev-any r :unit-state
                        #'(lambda (e) (and (eql (second e) 1) (eq (third e) :offline)))))
            #'(lambda (r) (snap! r h1)
-               (modbus-master-set-unit-enabled (rec-master r) 1 t)))
+               (modbus-set-unit-enabled (rec-master r) 1 t)))
      ;; 7: re-enabling brings it back online and republishes
      (list #'(lambda (r)
                (and (ev-any r :unit-state
@@ -445,7 +450,7 @@ total-len); else NIL."
   "The VALUES of the earliest span-update for SPAN-ID (EVENTS oldest-first)."
   (iter (for e in events)
         (when (and (eq (first e) :span-update) (eql (second e) span-id))
-          (return (sixth e)))))
+          (return (third e)))))
 
 (deftest test-modbus-master-loopback () ()
   (let ((timed-out nil)
@@ -465,15 +470,15 @@ total-len); else NIL."
                  (setf (rec-port rec) port)
                  (let ((master (modbus-master-open context
                                                    (list :tcp "127.0.0.1" port)
-                                                   rec)))
+                                                   rec
+                                                   :heartbeat 0.03
+                                                   :response-timeout 0.5)))
                    (setf (rec-master rec) master)
-                   (modbus-master-set-heartbeat master 30)
-                   (modbus-master-set-response-timeout master 500)
-                   (modbus-master-add-unit master 1 :stale-timeout-ms 3000)
-                   (setf (rec-h1 rec) (modbus-master-subscribe master 1 :holding 10 5)
-                         (rec-h2 rec) (modbus-master-subscribe master 1 :holding 100 5)
-                         (rec-c1 rec) (modbus-master-subscribe master 1 :coil 0 16
-                                                               :always t))
+                   (modbus-add-unit master 1 :stale-timeout 3.0)
+                   (setf (rec-h1 rec) (modbus-subscribe master 1 :holding 10 5)
+                         (rec-h2 rec) (modbus-subscribe master 1 :holding 100 5)
+                         (rec-c1 rec) (modbus-subscribe master 1 :coil 0 16
+                                                               :mode :always))
                    (setf (rec-phases rec) (build-master-phases rec))
                    (schedule context 0.02 #'(lambda () (rec-drive rec)) :repeat t)
                    (run-context context))))
@@ -491,23 +496,23 @@ total-len); else NIL."
       ;; write op completed OK
       (is (ev-any rec :write-done
                   #'(lambda (e) (and (eql (second e) (rec-op rec))
-                                     (eq (fourth e) :ok)))))
+                                     (eq (third e) :ok)))))
       ;; held read-back after the write
       (is (ev-any rec :span-update
                   #'(lambda (e) (and (eql (second e) h1)
-                                     (equalp (sixth e) #(7000 7001 7002 1003 1004))))))
+                                     (equalp (third e) #(7000 7001 7002 1003 1004))))))
       ;; change detection surfaced the new holding-100 values
       (is (ev-any rec :span-update
                   #'(lambda (e) (and (eql (second e) h2)
-                                     (equalp (sixth e) #(111 222 333 444 555))))))
+                                     (equalp (third e) #(111 222 333 444 555))))))
       ;; exception -> span stale + log
       (is (ev-any rec :span-state
                   #'(lambda (e) (and (eql (second e) (rec-he rec))
-                                     (eq (seventh e) :stale)))))
-      (is (ev-any rec :log #'(lambda (e) (eq (third e) :exception))))
+                                     (eq (third e) :stale)))))
+      (is (ev-any rec :log #'(lambda (e) (eq (second e) :exception))))
       ;; poll-seq left a span uncovered
       (is (ev-any rec :span-state
-                  #'(lambda (e) (and (eql (second e) h2) (eq (seventh e) :uncovered)))))
+                  #'(lambda (e) (and (eql (second e) h2) (eq (third e) :uncovered)))))
       ;; disable/enable cycled the unit's state
       (is (ev-any rec :unit-state
                   #'(lambda (e) (and (eql (second e) 1) (eq (third e) :offline)))))
@@ -537,18 +542,18 @@ total-len); else NIL."
            #'(lambda (r)
                (snap! r h1)
                (setf (rec-op r)
-                     (modbus-master-write (rec-master r) 1
+                     (modbus-write (rec-master r) 1
                                           '((:holding 10 (7000 7001))
                                             (:holding 12 (8000)))))))
      ;; 1: op completes ok, slave saw both writes in order, master read back
      (list #'(lambda (r)
                (and (ev-any r :write-done
                             #'(lambda (e) (and (eql (second e) (rec-op r))
-                                               (eq (fourth e) :ok))))
+                                               (eq (third e) :ok))))
                     (ev-any r :span-update
                             #'(lambda (e)
                                 (and (eql (second e) h1)
-                                     (equalp (sixth e)
+                                     (equalp (third e)
                                              #(7000 7001 8000 1003 1004)))))))
            #'(lambda (r)
                (snap! r h2)
@@ -580,13 +585,11 @@ total-len); else NIL."
                  (modbus-set-values slave 1 :holding 100 '(100 200 300 400 500))
                  (let ((master (modbus-master-open
                                 context (list :serial slave-path :baud 115200)
-                                rec)))
+                                rec :heartbeat 0.03 :response-timeout 0.3)))
                    (setf (rec-master rec) master)
-                   (modbus-master-set-heartbeat master 30)
-                   (modbus-master-set-response-timeout master 300)
-                   (modbus-master-add-unit master 1 :stale-timeout-ms 3000)
-                   (setf (rec-h1 rec) (modbus-master-subscribe master 1 :holding 10 5)
-                         (rec-h2 rec) (modbus-master-subscribe master 1 :holding 100 5))
+                   (modbus-add-unit master 1 :stale-timeout 3.0)
+                   (setf (rec-h1 rec) (modbus-subscribe master 1 :holding 10 5)
+                         (rec-h2 rec) (modbus-subscribe master 1 :holding 100 5))
                    (setf (rec-phases rec) (build-rtu-phases rec))
                    (schedule context 0.02 #'(lambda () (rec-drive rec)) :repeat t)
                    (run-context context)))
@@ -610,13 +613,13 @@ total-len); else NIL."
       ;; op completed and the master read the written values back
       (is (ev-any rec :write-done
                   #'(lambda (e) (and (eql (second e) (rec-op rec))
-                                     (eq (fourth e) :ok)))))
+                                     (eq (third e) :ok)))))
       (is (ev-any rec :span-update
                   #'(lambda (e) (and (eql (second e) h1)
-                                     (equalp (sixth e) #(7000 7001 8000 1003 1004))))))
+                                     (equalp (third e) #(7000 7001 8000 1003 1004))))))
       ;; change detection surfaced the new holding-100 values
       (is (ev-any rec :span-update
                   #'(lambda (e) (and (eql (second e) h2)
-                                     (equalp (sixth e) #(111 222 333 444 555))))))
+                                     (equalp (third e) #(111 222 333 444 555))))))
       ;; change-only: the unchanged block did not spam updates
       (is (<= (uc rec h2) 3)))))

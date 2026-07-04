@@ -74,18 +74,16 @@
    ;; modbus master
    #:modbus-master-open
    #:modbus-master-close
-   #:modbus-master-add-unit
-   #:modbus-master-subscribe
-   #:modbus-master-unsubscribe
-   #:modbus-master-refresh-span
-   #:modbus-master-set-unit-enabled
-   #:modbus-master-set-poll-seq
-   #:modbus-master-write
-   #:modbus-master-set-heartbeat
-   #:modbus-master-set-response-timeout
+   #:modbus-add-unit
+   #:modbus-subscribe
+   #:modbus-unsubscribe
+   #:modbus-refresh-span
+   #:modbus-set-unit-enabled
+   #:modbus-set-poll-seq
+   #:modbus-write
    #:on-modbus-span-update
    #:on-modbus-span-state
    #:on-modbus-unit-state
-   #:on-modbus-write-done
-   #:on-modbus-conn-state
+   #:on-modbus-write-complete
+   #:on-modbus-connection-state
    #:on-modbus-log))
