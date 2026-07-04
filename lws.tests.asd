@@ -7,5 +7,6 @@
   :serial t
   :pathname "tests"
   :components ((:file "package")
-               (:file "lws-test"))
+               (:file "lws-test")
+               (:file "modbus-test"))
   :depends-on (:lws :vtf :bordeaux-threads))

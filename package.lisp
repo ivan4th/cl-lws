@@ -61,4 +61,13 @@
    #:mqtt-unsubscribe
    #:mqtt-publish
    #:mqtt-disconnect
-   #:mqtt-session-established-p))
+   #:mqtt-session-established-p
+   ;; modbus slave
+   #:modbus-slave-open
+   #:modbus-slave-close
+   #:modbus-slave-listen-port
+   #:modbus-register-range
+   #:modbus-set-values
+   #:modbus-blacklist
+   #:on-modbus-slave-write
+   #:modbus-test-openpty))

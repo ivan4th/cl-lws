@@ -481,3 +481,27 @@ int csmb_rtu_wrap(uint8_t *buf, uint8_t unit, size_t pdu_len)
     buf[2 + pdu_len] = (uint8_t)(crc >> 8);
     return (int)(pdu_len + 3);
 }
+
+/* ---- write payload expansion (slave) ---- */
+
+int csmb_request_values(const csmb_request *r, uint16_t *out)
+{
+    uint16_t i;
+
+    switch (r->fc) {
+    case CSMB_FC_WRITE_SINGLE_COIL:
+    case CSMB_FC_WRITE_SINGLE_REG:
+        out[0] = r->value;
+        return CSMB_OK;
+    case CSMB_FC_WRITE_MULTI_COILS:
+        for (i = 0; i < r->count; i++)
+            out[i] = (uint16_t)((r->data[i >> 3] >> (i & 7)) & 1u);
+        return CSMB_OK;
+    case CSMB_FC_WRITE_MULTI_REGS:
+        for (i = 0; i < r->count; i++)
+            out[i] = (uint16_t)((r->data[2 * i] << 8) | r->data[2 * i + 1]);
+        return CSMB_OK;
+    default:
+        return CSMB_EINVAL;
+    }
+}

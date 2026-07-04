@@ -173,4 +173,141 @@ int csmb_build_write_response(uint8_t *pdu, uint8_t fc, uint16_t start,
 int csmb_mbap_wrap(uint8_t *buf, uint16_t tid, uint8_t unit, size_t pdu_len);
 int csmb_rtu_wrap(uint8_t *buf, uint8_t unit, size_t pdu_len);
 
+/* Expand a decoded (non-exception) write request into COUNT uint16
+ * register values (coils: one 0/1 per coil) written to OUT (r->count
+ * entries).  Returns 0, or CSMB_EINVAL if r->fc is not a write fc. */
+int csmb_request_values(const csmb_request *r, uint16_t *out);
+
+/* ---- slave register image (csmb-image.c) ----
+ *
+ * Per (unit, reg_type) a sorted (by start) singly-linked list of blocks.
+ * Coils/discretes store one uint16 per bit position for uniformity.
+ * A safe block accepts writes but discards them and always reads 0. */
+
+typedef struct csmb_block {
+    struct csmb_block *next;
+    uint16_t start;
+    uint16_t count;
+    uint8_t  writable;
+    uint8_t  safe;
+    uint16_t regs[];   /* COUNT entries */
+} csmb_block;
+
+typedef struct csmb_unit_image {
+    struct csmb_unit_image *next;
+    uint8_t unit;
+    csmb_block *blocks[CSMB_NUM_REG_TYPES];
+} csmb_unit_image;
+
+typedef struct csmb_image {
+    csmb_unit_image *units;
+} csmb_image;
+
+void csmb_image_init(csmb_image *img);
+void csmb_image_free(csmb_image *img);
+
+/* Register a data block.  WRITABLE / SAFE are 0/1.  Overlap with an
+ * existing block of the same (unit, reg_type) => CSMB_EOVERLAP; count 0
+ * or start+count > 65536 => CSMB_ERANGE; bad reg_type => CSMB_EBADTYPE;
+ * out of memory => CSMB_ENOMEM. */
+int csmb_image_register(csmb_image *img, uint8_t unit, int reg_type,
+                        uint16_t start, uint16_t count, int writable, int safe);
+
+/* Preset register values; the range must fall entirely within one
+ * registered block => else CSMB_ERANGE.  Safe blocks silently discard. */
+int csmb_image_set_values(csmb_image *img, uint8_t unit, int reg_type,
+                          uint16_t start, uint16_t count, const uint16_t *values);
+
+/* Ensure a unit exists in the image (blacklist bookkeeping). */
+int csmb_image_touch_unit(csmb_image *img, uint8_t unit);
+
+/* Nonzero if UNIT has at least one registered block in any reg_type. */
+int csmb_image_unit_has_ranges(csmb_image *img, uint8_t unit);
+
+/* Read COUNT registers into OUT.  Every register must lie in a
+ * registered or safe block (safe reads 0).  Returns CSMB_EXC_NONE or the
+ * modbus exception to reply with (CSMB_EXC_ILLEGAL_ADDRESS). */
+uint8_t csmb_image_read_range(csmb_image *img, uint8_t unit, int reg_type,
+                              uint16_t start, uint16_t count, uint16_t *out);
+
+/* Apply a write of COUNT registers.  Validated first: any register that
+ * is unregistered or in a read-only (non-writable, non-safe) block =>
+ * CSMB_EXC_ILLEGAL_ADDRESS and nothing is applied.  Writable registers
+ * are stored, safe registers discarded.  For each maximal run of applied
+ * (writable, non-safe) registers, APPLY (if non-NULL) is called with the
+ * run's start/count and the corresponding slice of VALUES.  Returns
+ * CSMB_EXC_NONE or the modbus exception to reply with. */
+typedef void (*csmb_apply_cb)(void *ctx, uint16_t start, uint16_t count,
+                              const uint16_t *values);
+uint8_t csmb_image_write_range(csmb_image *img, uint8_t unit, int reg_type,
+                               uint16_t start, uint16_t count,
+                               const uint16_t *values,
+                               csmb_apply_cb apply, void *ctx);
+
+/* ---- shared transport / connection glue (csmb-transport.c) ----
+ *
+ * struct lws / struct lws_vhost appear here only as incomplete-type
+ * pointers; the .c files that touch them include libwebsockets.h. */
+
+typedef enum csmb_conn_role {
+    CSMB_CONN_SLAVE_CHILD = 1,  /* accepted TCP connection served by a slave */
+    CSMB_CONN_MASTER_TCP  = 2,  /* master's outgoing TCP connection (later) */
+    CSMB_CONN_SERIAL      = 3   /* serial / fd RTU connection (later) */
+} csmb_conn_role_t;
+
+/* One queued tx chunk with LWS_PRE headroom ahead of the payload. */
+typedef struct csmb_txbuf {
+    struct csmb_txbuf *next;
+    size_t len;         /* payload length (excluding the LWS_PRE headroom) */
+    size_t off;         /* bytes already written */
+    uint8_t data[];     /* LWS_PRE headroom + LEN payload bytes */
+} csmb_txbuf;
+
+typedef struct csmb_conn {
+    int role;                  /* csmb_conn_role_t */
+    void *owner;               /* csmb_slave* / csmb_master*; NULL if detached */
+    struct lws *wsi;
+    csmb_txbuf *tx_head, *tx_tail;
+    int close_requested;       /* close once the tx queue drains */
+    csmb_mbap_parser mbap;     /* Modbus/TCP framing */
+    struct csmb_conn *next;    /* owner's connection list */
+} csmb_conn;
+
+/* Enqueue LEN bytes (copied, with LWS_PRE headroom) and request a
+ * writable callback.  Returns CSMB_OK or CSMB_ENOMEM. */
+int csmb_conn_send(csmb_conn *conn, const uint8_t *frame, size_t len);
+
+/* Flush one tx chunk (one lws_write per writable callback).  Returns -1
+ * to close the connection, 0 otherwise. */
+int csmb_conn_writable(csmb_conn *conn, struct lws *wsi);
+
+/* Free the tx queue and the connection (does not unlink it from any
+ * owner list; the caller does that first while the owner is alive). */
+void csmb_conn_free(csmb_conn *conn);
+
+/* The slave's listener vhost plus the heap strings lws keeps pointers to
+ * (vhost never copies them). */
+typedef struct csmb_listener {
+    struct lws_vhost *vhost;
+    char *vhost_name;
+    char *role_str;
+    char *proto_str;
+    char *iface_str;
+} csmb_listener;
+
+/* Create a raw-skt listener vhost for TR, storing OWNER as the vhost
+ * user pointer (so RAW_ADOPT can route to it).  Returns CSMB_OK,
+ * CSMB_ENOMEM, or CSMB_ETRANSPORT. */
+int csmb_transport_listen(csmb_listener *ln, struct lws_context *cx,
+                          const struct lws_protocols *protocols,
+                          const csmb_transport *tr, void *owner);
+void csmb_transport_listen_close(csmb_listener *ln);
+
+/* ---- slave hooks used by the lws dispatch (csmb-slave.c) ---- */
+
+csmb_conn *csmb_slave_on_adopt(csmb_slave *s, struct lws *wsi);
+int  csmb_slave_on_rx(csmb_slave *s, csmb_conn *conn,
+                      const uint8_t *buf, size_t len);
+void csmb_slave_detach_conn(csmb_slave *s, csmb_conn *conn);
+
 #endif /* CSMB_PRIVATE_H_INCLUDED */
