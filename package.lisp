@@ -70,4 +70,22 @@
    #:modbus-set-values
    #:modbus-blacklist
    #:on-modbus-slave-write
-   #:modbus-test-openpty))
+   #:modbus-test-openpty
+   ;; modbus master
+   #:modbus-master-open
+   #:modbus-master-close
+   #:modbus-master-add-unit
+   #:modbus-master-subscribe
+   #:modbus-master-unsubscribe
+   #:modbus-master-refresh-span
+   #:modbus-master-set-unit-enabled
+   #:modbus-master-set-poll-seq
+   #:modbus-master-write
+   #:modbus-master-set-heartbeat
+   #:modbus-master-set-response-timeout
+   #:on-modbus-span-update
+   #:on-modbus-span-state
+   #:on-modbus-unit-state
+   #:on-modbus-write-done
+   #:on-modbus-conn-state
+   #:on-modbus-log))

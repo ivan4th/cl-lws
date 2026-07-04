@@ -310,4 +310,180 @@ int  csmb_slave_on_rx(csmb_slave *s, csmb_conn *conn,
                       const uint8_t *buf, size_t len);
 void csmb_slave_detach_conn(csmb_slave *s, csmb_conn *conn);
 
+/* ---- master client connect (csmb-transport.c) ----
+ *
+ * Start an outgoing raw-TCP connection through CLIENT_VHOST; the returned
+ * csmb_conn has role CSMB_CONN_MASTER_TCP and OWNER as its owner, and its
+ * wsi is filled once lws hands it back (RAW_CONNECTED / error).  Returns
+ * NULL on immediate failure. */
+csmb_conn *csmb_transport_connect(struct lws_context *cx,
+                                  struct lws_vhost *client_vhost,
+                                  const csmb_transport *tr, void *owner);
+
+/* ---- master scheduler (csmb-sched.c) ----
+ *
+ * Pure logic (no lws): the span store, poll-program bunching, change
+ * detection, write FIFO and per-unit bookkeeping.  Events are emitted
+ * through a csmb_engine, which works without lws.  The master (csmb-
+ * master.c) owns the transport, timers and pump and drives this. */
+
+/* One subscribed span. */
+typedef struct csmb_span {
+    struct csmb_span *next;
+    int32_t  id;
+    uint8_t  unit;
+    uint8_t  reg_type;
+    uint16_t start;
+    uint16_t count;
+    uint32_t flags;        /* CSMB_SPAN_ALWAYS */
+    uint16_t *values;      /* last published values (count entries), or NULL */
+    int      have_values;  /* published at least once since the last clear */
+    int      force;        /* refresh_span: publish the next read unconditionally */
+    uint8_t  state;        /* last emitted csmb_state_t, 0 = none */
+} csmb_span;
+
+/* One request of a write op: a pre-built PDU plus verify metadata. */
+typedef struct csmb_wreq {
+    uint8_t  reg_type;
+    uint16_t start;
+    uint16_t count;
+    uint16_t verify;       /* echo we expect at pdu offset 3 (count/value) */
+    uint8_t  fc;
+    uint8_t  pdu[CSMB_MAX_PDU];
+    uint16_t plen;
+} csmb_wreq;
+
+/* A queued write op: N requests issued back-to-back. */
+typedef struct csmb_write_op {
+    struct csmb_write_op *next;
+    int64_t  op_id;
+    uint8_t  unit;
+    int      nreqs;
+    int      cur;          /* next request index to send */
+    csmb_wreq *reqs;
+} csmb_write_op;
+
+/* Per-unit scheduler bookkeeping. */
+typedef struct csmb_sunit {
+    struct csmb_sunit *next;
+    uint8_t  unit;
+    int      enabled;
+    uint32_t flags;        /* CSMB_UNIT_* */
+    uint32_t request_delay_ms;
+    uint32_t stale_timeout_ms;
+    csmb_range *poll_seq[CSMB_NUM_REG_TYPES];   /* explicit program, or NULL */
+    size_t   poll_seq_n[CSMB_NUM_REG_TYPES];
+    int      online;       /* has answered since the last stale/offline */
+    int      failing;      /* last request to it failed (deprioritise) */
+} csmb_sunit;
+
+/* One read request in the built poll program. */
+typedef struct csmb_readstep {
+    uint8_t  unit;
+    uint8_t  reg_type;
+    uint16_t start;
+    uint16_t count;
+} csmb_readstep;
+
+typedef struct csmb_sched {
+    csmb_sunit    *units;
+    csmb_span     *spans;
+    csmb_write_op *wq_head, *wq_tail;
+    int32_t next_span_id;
+    int64_t next_op_id;
+    csmb_readstep *program;    /* current round's read steps */
+    size_t  prog_len, prog_cap, prog_idx;
+} csmb_sched;
+
+typedef enum csmb_pick {
+    CSMB_PICK_NONE  = 0,
+    CSMB_PICK_READ  = 1,
+    CSMB_PICK_WRITE = 2
+} csmb_pick;
+
+/* A request selected by the pump; the caller MBAP/RTU-wraps pdu[0..plen)
+ * with a tid and sends it, then keeps this to interpret the response. */
+typedef struct csmb_pending {
+    int      kind;         /* csmb_pick */
+    uint8_t  unit;
+    uint8_t  fc;
+    uint8_t  reg_type;
+    uint16_t start;
+    uint16_t count;
+    uint8_t  pdu[CSMB_MAX_PDU];
+    uint16_t plen;
+    int64_t  op_id;        /* kind==WRITE */
+    int      req_index;    /* kind==WRITE */
+} csmb_pending;
+
+void csmb_sched_init(csmb_sched *sc);
+void csmb_sched_free(csmb_sched *sc);
+
+int  csmb_sched_add_unit(csmb_sched *sc, uint8_t unit, uint32_t request_delay_ms,
+                         uint32_t stale_timeout_ms, uint32_t flags);
+csmb_sunit *csmb_sched_find_unit(csmb_sched *sc, uint8_t unit);
+
+int32_t csmb_sched_subscribe(csmb_sched *sc, uint8_t unit, int reg_type,
+                             uint16_t start, uint16_t count, uint32_t flags);
+int  csmb_sched_unsubscribe(csmb_sched *sc, int32_t span_id);
+int  csmb_sched_refresh_span(csmb_sched *sc, int32_t span_id);
+int  csmb_sched_set_poll_seq(csmb_sched *sc, uint8_t unit, int reg_type,
+                             const csmb_range *ranges, size_t n);
+int64_t csmb_sched_enqueue_write(csmb_sched *sc, uint8_t unit,
+                                 const csmb_write_spec *reqs, size_t n);
+
+/* Bunch subscribed (start,count) ranges of REG_TYPE into read requests
+ * (merging gaps up to CSMB_MAX_DUMMY_BYTES, splitting at the per-type max
+ * read size).  Writes up to OUT_CAP results, returns the count needed. */
+size_t csmb_bunch_ranges(int reg_type, const csmb_range *in, size_t n,
+                         csmb_range *out, size_t out_cap);
+
+/* Rebuild the read program for a fresh poll round, in failing-unit order,
+ * skipping disabled units; emits one-shot CSMB_ST_UNCOVERED span-states
+ * for spans a unit's explicit poll_seq does not cover. */
+void csmb_sched_start_round(csmb_engine *e, csmb_sched *sc);
+
+/* Select the next request: a write op step (preempting reads) if any is
+ * pending, otherwise the next read of the current round.  Returns a
+ * csmb_pick and fills *p when non-NONE. */
+int  csmb_sched_pick(csmb_sched *sc, csmb_pending *p);
+
+/* Apply a well-formed response to the pending request: marks the unit
+ * online (republishing on recovery), advances/completes write ops, and
+ * runs change detection emitting SPAN_UPDATE / SPAN_STATE / WRITE_DONE /
+ * UNIT_STATE events on E. */
+void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
+                            const csmb_pending *p, const csmb_response *r);
+
+/* A pending request got no usable answer (response timeout / connection
+ * error).  Reads mark the unit failing (and emit a one-shot LOG); a write
+ * op fails with WR_STATUS. */
+void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
+                                  const csmb_pending *p, int wr_status);
+
+/* The per-unit stale timer fired: the unit's spans go STALE and it goes
+ * offline (values cleared so recovery republishes). */
+void csmb_sched_mark_unit_stale(csmb_engine *e, csmb_sched *sc, uint8_t unit);
+
+/* Enable/disable polling of a unit; disabling fails its queued writes
+ * with CSMB_WR_UNIT_DISABLED and staled its spans, enabling clears their
+ * values so everything republishes.  Returns CSMB_OK / CSMB_ENOUNIT. */
+int  csmb_sched_set_unit_enabled(csmb_engine *e, csmb_sched *sc,
+                                 uint8_t unit, int enabled);
+
+/* Transport went down: all spans go OFFLINE with values cleared, all
+ * units offline, queued writes fail with WR_CONN_FAILED. */
+void csmb_sched_connection_down(csmb_engine *e, csmb_sched *sc);
+
+/* Transport (re)connected: clear every span's published values so the
+ * next reads republish; drop the stale poll program. */
+void csmb_sched_connection_up(csmb_sched *sc);
+
+/* ---- master hooks used by the lws dispatch (csmb-master.c) ---- */
+
+void csmb_master_on_connected(csmb_master *m, struct lws *wsi);
+void csmb_master_on_connect_error(csmb_master *m);
+int  csmb_master_on_rx(csmb_master *m, const uint8_t *buf, size_t len);
+void csmb_master_on_closed(csmb_master *m);
+
 #endif /* CSMB_PRIVATE_H_INCLUDED */

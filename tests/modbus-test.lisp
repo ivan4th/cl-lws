@@ -273,3 +273,246 @@ total-len); else NIL."
         (is (equalp #(1) (fourth e1)))
         (is (equal '(1 :holding 15) (subseq e2 0 3)))
         (is (equalp #(4242) (fourth e2)))))))
+
+;;; Modbus/TCP master loopback: a C csmb_master polls a C csmb_slave (both
+;;; in one lws context).  A recorder collects the master events, and a
+;;; timer-driven phase machine walks initial publish, a write op + held
+;;; read-back, change detection, ALWAYS vs change-only, refresh-span,
+;;; exception -> stale, poll-seq / :uncovered, disable / enable, and a
+;;; transport teardown + reconnect that republishes everything.
+
+(defclass mb-master-recorder ()
+  ((context :initarg :context :accessor rec-context)
+   (master  :initform nil :accessor rec-master)
+   (slave   :initform nil :accessor rec-slave)
+   (port    :initform 0 :accessor rec-port)
+   (h1 :accessor rec-h1) (h2 :accessor rec-h2) (c1 :accessor rec-c1)
+   (he :initform nil :accessor rec-he)
+   (op :initform nil :accessor rec-op)
+   (events  :initform '() :accessor rec-events)        ;; reversed
+   (ucounts :initform (make-hash-table) :accessor rec-ucounts)
+   (bases   :initform (make-hash-table) :accessor rec-bases)
+   (phases  :initform #() :accessor rec-phases)
+   (phase   :initform 0 :accessor rec-phase)
+   (online       :initform nil :accessor rec-online)
+   (online-count :initform 0 :accessor rec-online-count)
+   (offline-count :initform 0 :accessor rec-offline-count)
+   (base-online  :initform 0 :accessor rec-base-online)
+   (base-offline :initform 0 :accessor rec-base-offline)
+   (done    :initform nil :accessor rec-done)))
+
+(defun configure-loopback-slave (slave)
+  "Register the ranges + presets the master loopback expects on SLAVE."
+  (modbus-register-range slave 1 :holding 10 10 :writable t)
+  (modbus-register-range slave 1 :holding 100 5)
+  (modbus-register-range slave 1 :coil 0 16 :writable t)
+  (modbus-set-values slave 1 :holding 10
+                     '(1000 1001 1002 1003 1004 1005 1006 1007 1008 1009))
+  (modbus-set-values slave 1 :holding 100 '(100 200 300 400 500))
+  (modbus-set-values slave 1 :coil 0 *mb-coil-pattern*))
+
+(defun uc   (rec id) (gethash id (rec-ucounts rec) 0))
+(defun base (rec id) (gethash id (rec-bases rec) 0))
+(defun snap! (rec id) (setf (gethash id (rec-bases rec)) (uc rec id)))
+
+(defun ev-any (rec type test)
+  (some #'(lambda (e) (and (eq (first e) type) (funcall test e)))
+        (rec-events rec)))
+
+(defmethod on-modbus-span-update ((h mb-master-recorder) master span-id unit
+                                  reg-type start values)
+  (declare (ignore master))
+  (push (list :span-update span-id unit reg-type start values) (rec-events h))
+  (incf (gethash span-id (rec-ucounts h) 0)))
+
+(defmethod on-modbus-span-state ((h mb-master-recorder) master span-id unit
+                                 reg-type start count state)
+  (declare (ignore master))
+  (push (list :span-state span-id unit reg-type start count state) (rec-events h)))
+
+(defmethod on-modbus-unit-state ((h mb-master-recorder) master unit state)
+  (declare (ignore master))
+  (push (list :unit-state unit state) (rec-events h)))
+
+(defmethod on-modbus-write-done ((h mb-master-recorder) master op-id unit
+                                 status exception aux)
+  (declare (ignore master))
+  (push (list :write-done op-id unit status exception aux) (rec-events h)))
+
+(defmethod on-modbus-conn-state ((h mb-master-recorder) master state error)
+  (declare (ignore master))
+  (push (list :conn-state state error) (rec-events h))
+  (case state
+    (:online  (setf (rec-online h) t) (incf (rec-online-count h)))
+    (:offline (incf (rec-offline-count h)))))
+
+(defmethod on-modbus-log ((h mb-master-recorder) master unit kind fc exception)
+  (declare (ignore master))
+  (push (list :log unit kind fc exception) (rec-events h)))
+
+(defun build-master-phases (rec)
+  (let ((h1 (rec-h1 rec)) (h2 (rec-h2 rec)) (c1 (rec-c1 rec)))
+    (vector
+     ;; 0: initial publish of all three spans, connection online
+     (list #'(lambda (r) (and (rec-online r)
+                              (>= (uc r h1) 1) (>= (uc r h2) 1) (>= (uc r c1) 1)))
+           #'(lambda (r)
+               (setf (rec-op r)
+                     (modbus-master-write (rec-master r) 1
+                                          '((:holding 10 (7000 7001 7002)))))))
+     ;; 1: write completes and the held read-back publishes the new value
+     (list #'(lambda (r)
+               (and (ev-any r :write-done
+                            #'(lambda (e) (and (eql (second e) (rec-op r))
+                                               (eq (fourth e) :ok))))
+                    (ev-any r :span-update
+                            #'(lambda (e) (and (eql (second e) h1)
+                                               (equalp (sixth e)
+                                                       #(7000 7001 7002 1003 1004)))))))
+           #'(lambda (r)
+               (snap! r h2)
+               (modbus-set-values (rec-slave r) 1 :holding 100
+                                  '(111 222 333 444 555))))
+     ;; 2: change detection republishes the changed holding block
+     (list #'(lambda (r) (> (uc r h2) (base r h2)))
+           #'(lambda (r) (snap! r h1) (modbus-master-refresh-span (rec-master r) h1)))
+     ;; 3: refresh-span republishes the unchanged block
+     (list #'(lambda (r) (> (uc r h1) (base r h1)))
+           #'(lambda (r)
+               (setf (rec-he r)
+                     (modbus-master-subscribe (rec-master r) 1 :holding 50 3))))
+     ;; 4: an unregistered read draws an exception -> span stale + log
+     (list #'(lambda (r)
+               (and (rec-he r)
+                    (ev-any r :span-state
+                            #'(lambda (e) (and (eql (second e) (rec-he r))
+                                               (eq (seventh e) :stale))))
+                    (ev-any r :log #'(lambda (e) (eq (third e) :exception)))))
+           #'(lambda (r)
+               (modbus-master-set-poll-seq (rec-master r) 1 :holding '((10 5)))))
+     ;; 5: poll-seq leaves h2 uncovered
+     (list #'(lambda (r)
+               (ev-any r :span-state
+                       #'(lambda (e) (and (eql (second e) h2)
+                                          (eq (seventh e) :uncovered)))))
+           #'(lambda (r)
+               (modbus-master-set-poll-seq (rec-master r) 1 :holding '())
+               (modbus-master-set-unit-enabled (rec-master r) 1 nil)))
+     ;; 6: disabling takes the unit offline
+     (list #'(lambda (r)
+               (ev-any r :unit-state
+                       #'(lambda (e) (and (eql (second e) 1) (eq (third e) :offline)))))
+           #'(lambda (r) (snap! r h1)
+               (modbus-master-set-unit-enabled (rec-master r) 1 t)))
+     ;; 7: re-enabling brings it back online and republishes
+     (list #'(lambda (r)
+               (and (ev-any r :unit-state
+                            #'(lambda (e) (and (eql (second e) 1) (eq (third e) :online))))
+                    (> (uc r h1) (base r h1))))
+           #'(lambda (r)
+               ;; tear the transport down: hard-blacklisting the unit makes
+               ;; the slave drop the master's connection on its next request
+               (snap! r h1)
+               (setf (rec-base-online r) (rec-online-count r)
+                     (rec-base-offline r) (rec-offline-count r))
+               (modbus-blacklist (rec-slave r) 1 :hard)))
+     ;; 8: the connection dropped; clear the blacklist so reconnect succeeds
+     (list #'(lambda (r) (> (rec-offline-count r) (rec-base-offline r)))
+           #'(lambda (r) (modbus-blacklist (rec-slave r) 1 :none)))
+     ;; 9: the master reconnected to the same slave and republished
+     (list #'(lambda (r)
+               (and (> (rec-online-count r) (rec-base-online r))
+                    (> (uc r h1) (base r h1))))
+           #'(lambda (r) (declare (ignore r)))))))
+
+(defun rec-drive (rec)
+  (unless (rec-done rec)
+    (let ((phases (rec-phases rec)))
+      (if (>= (rec-phase rec) (length phases))
+          (progn (setf (rec-done rec) t) (stop-context (rec-context rec)))
+          (destructuring-bind (pred action) (aref phases (rec-phase rec))
+            (when (funcall pred rec)
+              (funcall action rec)
+              (incf (rec-phase rec))))))))
+
+(defun first-update-values (events span-id)
+  "The VALUES of the earliest span-update for SPAN-ID (EVENTS oldest-first)."
+  (iter (for e in events)
+        (when (and (eq (first e) :span-update) (eql (second e) span-id))
+          (return (sixth e)))))
+
+(deftest test-modbus-master-loopback () ()
+  (let ((timed-out nil)
+        (rec nil))
+    (with-lws-context (context)
+      (setf rec (make-instance 'mb-master-recorder :context context))
+      (let ((slave (modbus-slave-open context '(:tcp-listen 0 :iface "127.0.0.1")
+                                      rec)))
+        (setf (rec-slave rec) slave)
+        (unwind-protect
+             (progn
+               (schedule context *test-timeout-seconds*
+                         #'(lambda () (setf timed-out t) (stop-context context)))
+               (configure-loopback-slave slave)
+               (let ((port (modbus-slave-listen-port slave)))
+                 (is (plusp port))
+                 (setf (rec-port rec) port)
+                 (let ((master (modbus-master-open context
+                                                   (list :tcp "127.0.0.1" port)
+                                                   rec)))
+                   (setf (rec-master rec) master)
+                   (modbus-master-set-heartbeat master 30)
+                   (modbus-master-set-response-timeout master 500)
+                   (modbus-master-add-unit master 1 :stale-timeout-ms 3000)
+                   (setf (rec-h1 rec) (modbus-master-subscribe master 1 :holding 10 5)
+                         (rec-h2 rec) (modbus-master-subscribe master 1 :holding 100 5)
+                         (rec-c1 rec) (modbus-master-subscribe master 1 :coil 0 16
+                                                               :always t))
+                   (setf (rec-phases rec) (build-master-phases rec))
+                   (schedule context 0.02 #'(lambda () (rec-drive rec)) :repeat t)
+                   (run-context context))))
+          (when (rec-master rec) (modbus-master-close (rec-master rec)))
+          (modbus-slave-close slave))))
+
+    (is (null timed-out))
+    (is (rec-online rec))
+    (let ((events (reverse (rec-events rec)))
+          (h1 (rec-h1 rec)) (h2 (rec-h2 rec)) (c1 (rec-c1 rec)))
+      ;; initial published values
+      (is (equalp #(1000 1001 1002 1003 1004) (first-update-values events h1)))
+      (is (equalp #(100 200 300 400 500) (first-update-values events h2)))
+      (is (equalp (coerce *mb-coil-pattern* 'vector) (first-update-values events c1)))
+      ;; write op completed OK
+      (is (ev-any rec :write-done
+                  #'(lambda (e) (and (eql (second e) (rec-op rec))
+                                     (eq (fourth e) :ok)))))
+      ;; held read-back after the write
+      (is (ev-any rec :span-update
+                  #'(lambda (e) (and (eql (second e) h1)
+                                     (equalp (sixth e) #(7000 7001 7002 1003 1004))))))
+      ;; change detection surfaced the new holding-100 values
+      (is (ev-any rec :span-update
+                  #'(lambda (e) (and (eql (second e) h2)
+                                     (equalp (sixth e) #(111 222 333 444 555))))))
+      ;; exception -> span stale + log
+      (is (ev-any rec :span-state
+                  #'(lambda (e) (and (eql (second e) (rec-he rec))
+                                     (eq (seventh e) :stale)))))
+      (is (ev-any rec :log #'(lambda (e) (eq (third e) :exception))))
+      ;; poll-seq left a span uncovered
+      (is (ev-any rec :span-state
+                  #'(lambda (e) (and (eql (second e) h2) (eq (seventh e) :uncovered)))))
+      ;; disable/enable cycled the unit's state
+      (is (ev-any rec :unit-state
+                  #'(lambda (e) (and (eql (second e) 1) (eq (third e) :offline)))))
+      (is (ev-any rec :unit-state
+                  #'(lambda (e) (and (eql (second e) 1) (eq (third e) :online)))))
+      ;; ALWAYS coil polled repeatedly; change-only holding did not
+      (is (>= (uc rec c1) 3))
+      (is (< (uc rec h1) (uc rec c1)))
+      ;; transport teardown + reconnect: went offline then back online
+      (is (>= (rec-offline-count rec) 1))
+      (is (>= (rec-online-count rec) 2))
+      (is (ev-any rec :conn-state
+                  #'(lambda (e) (and (eq (second e) :offline)
+                                     (member (third e) '(:closed :timeout :connect-failed)))))))))

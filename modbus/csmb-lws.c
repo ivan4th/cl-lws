@@ -47,6 +47,9 @@ int csmb_lws_protocol_callback(struct lws *wsi,
         case CSMB_CONN_SLAVE_CHILD:
             ret = csmb_slave_on_rx((csmb_slave *)conn->owner, conn, in, len);
             break;
+        case CSMB_CONN_MASTER_TCP:
+            ret = csmb_master_on_rx((csmb_master *)conn->owner, in, len);
+            break;
         default:
             break;
         }
@@ -60,6 +63,28 @@ int csmb_lws_protocol_callback(struct lws *wsi,
             return 0;
         return csmb_conn_writable(conn, wsi);
 
+    case LWS_CALLBACK_RAW_CONNECTED:
+        conn = lws_get_opaque_user_data(wsi);
+        if (!conn || !conn->owner)
+            return 0;
+        if (conn->role == CSMB_CONN_MASTER_TCP) {
+            csmb_master_on_connected((csmb_master *)conn->owner, wsi);
+            csmb_event_flush((csmb_engine *)conn->owner);
+        }
+        return 0;
+
+    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        conn = lws_get_opaque_user_data(wsi);
+        if (!conn)
+            return 0;
+        if (conn->owner && conn->role == CSMB_CONN_MASTER_TCP) {
+            csmb_master_on_connect_error((csmb_master *)conn->owner);
+            csmb_event_flush((csmb_engine *)conn->owner);
+        }
+        csmb_conn_free(conn);
+        lws_set_opaque_user_data(wsi, NULL);
+        return 0;
+
     case LWS_CALLBACK_RAW_CLOSE:
         conn = lws_get_opaque_user_data(wsi);
         if (!conn)
@@ -69,17 +94,16 @@ int csmb_lws_protocol_callback(struct lws *wsi,
             case CSMB_CONN_SLAVE_CHILD:
                 csmb_slave_detach_conn((csmb_slave *)conn->owner, conn);
                 break;
+            case CSMB_CONN_MASTER_TCP:
+                csmb_master_on_closed((csmb_master *)conn->owner);
+                break;
             default:
                 break;
             }
+            csmb_event_flush((csmb_engine *)conn->owner);
         }
         csmb_conn_free(conn);
         lws_set_opaque_user_data(wsi, NULL);
-        return 0;
-
-    case LWS_CALLBACK_RAW_CONNECTED:
-    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-        /* master TCP client: later stage */
         return 0;
 
     default:

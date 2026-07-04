@@ -20,7 +20,7 @@ LWS_OBJS = csmb-lws.o csmb-master.o csmb-slave.o csmb-transport.o csmb-misc.o
 
 OBJS = $(PURE_OBJS) $(LWS_OBJS)
 
-TESTS = tests/test-event tests/test-codec tests/test-image
+TESTS = tests/test-event tests/test-codec tests/test-image tests/test-sched
 
 all: $(LIB)
 

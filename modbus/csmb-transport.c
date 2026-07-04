@@ -128,3 +128,45 @@ void csmb_transport_listen_close(csmb_listener *ln)
     free(ln->iface_str);
     ln->vhost_name = ln->role_str = ln->proto_str = ln->iface_str = NULL;
 }
+
+/* ---- master outgoing TCP connect ----
+ *
+ * A raw-skt client connection bound to the "cs-modbus" protocol on
+ * CLIENT_VHOST; the csmb_conn is the wsi's opaque user data, so
+ * RAW_CONNECTED / CLIENT_CONNECTION_ERROR / RAW_RX / RAW_CLOSE route
+ * back to it. */
+
+csmb_conn *csmb_transport_connect(struct lws_context *cx,
+                                  struct lws_vhost *client_vhost,
+                                  const csmb_transport *tr, void *owner)
+{
+    struct lws_client_connect_info info;
+    csmb_conn *conn = calloc(1, sizeof(*conn));
+    struct lws *wsi;
+
+    if (!conn)
+        return NULL;
+    conn->role = CSMB_CONN_MASTER_TCP;
+    conn->owner = owner;
+    csmb_mbap_parser_init(&conn->mbap);
+
+    memset(&info, 0, sizeof(info));
+    info.context = cx;
+    info.vhost = client_vhost;
+    info.address = tr->host_or_device;
+    info.host = tr->host_or_device;
+    info.port = tr->port;
+    info.method = "RAW";
+    info.local_protocol_name = "cs-modbus";
+    info.opaque_user_data = conn;
+    info.pwsi = &wsi;
+
+    wsi = lws_client_connect_via_info(&info);
+    if (!wsi) {
+        free(conn);
+        return NULL;
+    }
+    conn->wsi = wsi;
+    lws_set_opaque_user_data(wsi, conn);
+    return conn;
+}
