@@ -80,3 +80,83 @@ levels are the usual LLL_* bitmask (255/4095 for more).
 - lws_service ignores its timeout arg (since v3.2); the loop blocks
   until lws has something to do. Cross-thread wakeup = lws:defer
   (queue + lws_cancel_service).
+
+## Modbus engine (csmb)
+
+A small C library in `modbus/` (`libcsmodbus`) implementing a Modbus
+master and slave over TCP or RTU (serial/fd), driven from Lisp through
+CFFI (`modbus.lisp`).  The public contract is `modbus/csmb.h` — treat it
+as the spec.
+
+### Layout
+
+- `csmb.h` — public API/enums (do not change the API; comments OK).
+- `csmb-private.h` — internal structs shared across the C sources; kept
+  free of `libwebsockets.h` so the pure-logic units build without lws.
+- `csmb-codec.c` — PDU encode/decode, MBAP + RTU framing, CRC16 (pure).
+- `csmb-sched.c` — master scheduler: span store, poll-program bunching,
+  change detection, write FIFO, per-unit bookkeeping (pure).
+- `csmb-image.c` — slave register image (pure).
+- `csmb-event.c` — event batching/arena (pure).
+- `csmb-transport.c` — tx queue, TCP listen/connect, serial open + fd
+  adoption.
+- `csmb-master.c` / `csmb-slave.c` — the lws-facing engines.
+- `csmb-lws.c` — the single `"cs-modbus"` protocol callback.
+
+### Build & test
+
+- ASDF loads it via a custom `modbus-c-library` component that runs
+  `make -C modbus` and loads the dylib; you rarely build it by hand.
+- C unit tests: `make -C modbus clean all check` (event/codec/image/sched;
+  `-Wall -Wextra -Werror -std=c99`, clean under ASan/UBSan).
+- Fuzzers (coverage-guided, clang + libFuzzer only, not part of `check`):
+  `make -C modbus fuzz` builds `tests/fuzz-{mbap,rtu,request}` (skips
+  gracefully without libFuzzer).  Each also builds standalone under plain
+  ASan (compile a harness without `-DCSMB_LIBFUZZER`) for toolchains
+  lacking the libFuzzer runtime (e.g. Apple clang).
+- Lisp loopback tests in `tests/modbus-test.lisp`
+  (`test-modbus-slave-loopback`, `-master-loopback`, `-rtu-loopback` over
+  an openpty pair): `(vtf:run-tests 'lws.tests)`.
+
+### Event-batch drain contract
+
+Engines batch events; the notify callback fires at most once per C-side
+activation (lws callback / sul timer / a public API call that can emit
+synchronously).  The consumer drains with `csmb_events_get()` (freezes
+the batch) then `csmb_events_done()` (releases it); event payload pointers
+(`values`) are valid only until `events_done`.  Calls made from inside the
+notify land in the next batch.  In Lisp this is `%modbus-drain-events`,
+fanning events out to the `on-modbus-*` handler generics.
+
+**Everything is event-loop-thread-only** — no csmb API is thread-safe;
+marshal cross-thread work through `lws:defer`.
+
+### Transports
+
+- `(:tcp HOST PORT)` master / `(:tcp-listen PORT :iface ...)` slave — MBAP
+  framing, responses matched by transaction id.
+- `(:serial DEVICE :baud .. :parity :none|:even|:odd :data-bits .. :stop-bits ..
+  :t35 SECONDS)` — RTU framing (`csmb_rtu_wrap`, no tid; the master matches
+  responses by unit + function code).  `csmb_serial_open` sets raw termios
+  and tolerates `cfsetspeed` failures on ptys (logs + continues).
+- `(:fd FD)` — adopt an already-open fd; the engine takes ownership and
+  closes it.  A handed-over fd cannot be reopened, so on close the master
+  goes permanently offline (`CSMB_CERR_CLOSED`); a serial *device* is
+  reopened with the reconnect/backoff FSM.
+
+### RTU notes
+
+- **t3.5 idle gap**: a per-connection lws sul, re-armed on every RX chunk
+  to `t35_us` (0 ⇒ derived from baud, floor 1750us); on fire it resets the
+  RTU parser to resync after a partial/garbled frame.  `CSMB_PR_BAD` also
+  resets the parser.  The master keeps a ≥ t3.5 gap between its own frames
+  via the request-pacing mechanism.
+- **RTU slave is multi-drop and silent**: it answers only units it serves
+  (registered ranges), stays silent for others (no `GW_TARGET` — that is a
+  TCP-gateway behavior), and never drops the shared bus.  Unit 0 is a
+  broadcast: writes are applied (and surfaced as `SLAVE_WRITE`) with no
+  reply; reads are ignored.
+- **TCP dead-peer detection**: after 5 consecutive response timeouts with
+  no valid frame in between, the master drops the connection
+  (`CSMB_CERR_TIMEOUT`) and reconnects; the counter resets on any valid
+  frame.

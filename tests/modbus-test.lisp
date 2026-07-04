@@ -299,7 +299,13 @@ total-len); else NIL."
    (offline-count :initform 0 :accessor rec-offline-count)
    (base-online  :initform 0 :accessor rec-base-online)
    (base-offline :initform 0 :accessor rec-base-offline)
+   (slave-writes :initform '() :accessor rec-slave-writes)   ;; reversed
    (done    :initform nil :accessor rec-done)))
+
+(defmethod on-modbus-slave-write ((h mb-master-recorder) slave unit reg-type
+                                  start values)
+  (declare (ignore slave))
+  (push (list unit reg-type start values) (rec-slave-writes h)))
 
 (defun configure-loopback-slave (slave)
   "Register the ranges + presets the master loopback expects on SLAVE."
@@ -516,3 +522,101 @@ total-len); else NIL."
       (is (ev-any rec :conn-state
                   #'(lambda (e) (and (eq (second e) :offline)
                                      (member (third e) '(:closed :timeout :connect-failed)))))))))
+
+;;; Modbus/RTU loopback over a pty pair: a C slave on the pty master fd
+;;; (:fd), a C master on the pty slave device (:serial).  Covers initial
+;;; publish, a two-request write op (slave sees both writes in order, the
+;;; op completes :ok, the master reads the values back), change detection,
+;;; and change-only silence.
+
+(defun build-rtu-phases (rec)
+  (let ((h1 (rec-h1 rec)) (h2 (rec-h2 rec)))
+    (vector
+     ;; 0: initial publish of both spans
+     (list #'(lambda (r) (and (rec-online r) (>= (uc r h1) 1) (>= (uc r h2) 1)))
+           #'(lambda (r)
+               (snap! r h1)
+               (setf (rec-op r)
+                     (modbus-master-write (rec-master r) 1
+                                          '((:holding 10 (7000 7001))
+                                            (:holding 12 (8000)))))))
+     ;; 1: op completes ok, slave saw both writes in order, master read back
+     (list #'(lambda (r)
+               (and (ev-any r :write-done
+                            #'(lambda (e) (and (eql (second e) (rec-op r))
+                                               (eq (fourth e) :ok))))
+                    (ev-any r :span-update
+                            #'(lambda (e)
+                                (and (eql (second e) h1)
+                                     (equalp (sixth e)
+                                             #(7000 7001 8000 1003 1004)))))))
+           #'(lambda (r)
+               (snap! r h2)
+               (modbus-set-values (rec-slave r) 1 :holding 100
+                                  '(111 222 333 444 555))))
+     ;; 2: the changed block republishes
+     (list #'(lambda (r) (> (uc r h2) (base r h2)))
+           #'(lambda (r) (declare (ignore r)))))))
+
+(deftest test-modbus-rtu-loopback () ()
+  (let ((timed-out nil)
+        (rec nil)
+        (master-fd nil))
+    (multiple-value-bind (mfd slave-path) (modbus-test-openpty)
+      (setf master-fd mfd)
+      (with-lws-context (context)
+        (setf rec (make-instance 'mb-master-recorder :context context))
+        (let ((slave (modbus-slave-open context (list :fd master-fd) rec)))
+          (setf (rec-slave rec) slave)
+          (unwind-protect
+               (progn
+                 (schedule context *test-timeout-seconds*
+                           #'(lambda () (setf timed-out t) (stop-context context)))
+                 (modbus-register-range slave 1 :holding 10 10 :writable t)
+                 (modbus-register-range slave 1 :holding 100 5)
+                 (modbus-set-values slave 1 :holding 10
+                                    '(1000 1001 1002 1003 1004
+                                      1005 1006 1007 1008 1009))
+                 (modbus-set-values slave 1 :holding 100 '(100 200 300 400 500))
+                 (let ((master (modbus-master-open
+                                context (list :serial slave-path :baud 115200)
+                                rec)))
+                   (setf (rec-master rec) master)
+                   (modbus-master-set-heartbeat master 30)
+                   (modbus-master-set-response-timeout master 300)
+                   (modbus-master-add-unit master 1 :stale-timeout-ms 3000)
+                   (setf (rec-h1 rec) (modbus-master-subscribe master 1 :holding 10 5)
+                         (rec-h2 rec) (modbus-master-subscribe master 1 :holding 100 5))
+                   (setf (rec-phases rec) (build-rtu-phases rec))
+                   (schedule context 0.02 #'(lambda () (rec-drive rec)) :repeat t)
+                   (run-context context)))
+            (when (rec-master rec) (modbus-master-close (rec-master rec)))
+            (modbus-slave-close slave)))))
+
+    (is (null timed-out))
+    (is (rec-online rec))
+    (let ((events (reverse (rec-events rec)))
+          (h1 (rec-h1 rec)) (h2 (rec-h2 rec))
+          (writes (reverse (rec-slave-writes rec))))
+      ;; initial values
+      (is (equalp #(1000 1001 1002 1003 1004) (first-update-values events h1)))
+      (is (equalp #(100 200 300 400 500) (first-update-values events h2)))
+      ;; two-request write op: slave saw both writes in order
+      (is (>= (length writes) 2))
+      (is (equal '(1 :holding 10) (subseq (first writes) 0 3)))
+      (is (equalp #(7000 7001) (fourth (first writes))))
+      (is (equal '(1 :holding 12) (subseq (second writes) 0 3)))
+      (is (equalp #(8000) (fourth (second writes))))
+      ;; op completed and the master read the written values back
+      (is (ev-any rec :write-done
+                  #'(lambda (e) (and (eql (second e) (rec-op rec))
+                                     (eq (fourth e) :ok)))))
+      (is (ev-any rec :span-update
+                  #'(lambda (e) (and (eql (second e) h1)
+                                     (equalp (sixth e) #(7000 7001 8000 1003 1004))))))
+      ;; change detection surfaced the new holding-100 values
+      (is (ev-any rec :span-update
+                  #'(lambda (e) (and (eql (second e) h2)
+                                     (equalp (sixth e) #(111 222 333 444 555))))))
+      ;; change-only: the unchanged block did not spam updates
+      (is (<= (uc rec h2) 3)))))

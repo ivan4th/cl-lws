@@ -150,9 +150,9 @@ is an (unsigned-byte 16) array of the written register values (coils: one
 ;;; transport construction + public API
 
 (defun %call-with-tcp-transport (port iface thunk)
-  "Build a CSMB_TR_TCP transport on the stack and call THUNK with its
-pointer.  The C side copies HOST_OR_DEVICE, so the iface string only
-needs to live across the call."
+  "Build a CSMB_TR_TCP transport and call THUNK with its pointer.  The C
+side copies HOST_OR_DEVICE, so the iface/host string only needs to live
+across the call."
   (flet ((build (iface-ptr)
            (with-lws-object (transport
                              (:struct csmb-transport)
@@ -165,31 +165,75 @@ needs to live across the call."
           (build iface-str))
         (build (cffi:null-pointer)))))
 
+(defun %call-with-serial-transport (device baud parity data-bits stop-bits t35 thunk)
+  "Build a CSMB_TR_SERIAL transport.  BAUD/DATA-BITS/STOP-BITS 0 = default;
+PARITY is :none/:even/:odd; T35 is the inter-frame gap in seconds (0 =
+from baud)."
+  (cffi:with-foreign-string (dev device)
+    (with-lws-object (transport
+                      (:struct csmb-transport)
+                      kind (cffi:foreign-enum-value 'csmb-transport-kind :serial)
+                      host-or-device dev
+                      baud baud
+                      data-bits data-bits
+                      parity (cffi:foreign-enum-value 'csmb-parity parity)
+                      stop-bits stop-bits
+                      t35-us (round (* t35 1000000)))
+      (funcall thunk transport))))
+
+(defun %call-with-fd-transport (fd thunk)
+  "Build a CSMB_TR_FD transport (the engine takes ownership of FD)."
+  (with-lws-object (transport
+                    (:struct csmb-transport)
+                    kind (cffi:foreign-enum-value 'csmb-transport-kind :fd)
+                    fd fd)
+    (funcall thunk transport)))
+
+(defun %call-with-transport (spec thunk)
+  "Dispatch a transport SPEC to the right builder and call THUNK with the
+csmb_transport pointer.  SPEC is (:tcp HOST PORT), (:tcp-listen PORT &key
+IFACE), (:serial DEVICE &key BAUD PARITY DATA-BITS STOP-BITS T35) or
+(:fd FD)."
+  (ecase (first spec)
+    (:tcp
+     (destructuring-bind (host port) (rest spec)
+       (%call-with-tcp-transport port host thunk)))
+    (:tcp-listen
+     (destructuring-bind (port &key iface) (rest spec)
+       (%call-with-tcp-transport port iface thunk)))
+    (:serial
+     (destructuring-bind (device &key (baud 0) (parity :none) (data-bits 0)
+                                      (stop-bits 0) (t35 0))
+         (rest spec)
+       (%call-with-serial-transport device baud parity data-bits stop-bits t35
+                                    thunk)))
+    (:fd
+     (destructuring-bind (fd) (rest spec)
+       (%call-with-fd-transport fd thunk)))))
+
 (defun modbus-slave-open (context transport handler)
   "Open a Modbus slave on CONTEXT.  TRANSPORT is (:tcp-listen PORT &key
-IFACE) (PORT 0 = ephemeral).  HANDLER receives ON-MODBUS-SLAVE-WRITE for
-register writes.  Returns a modbus-slave."
+IFACE) (PORT 0 = ephemeral), (:serial DEVICE &key BAUD PARITY DATA-BITS
+STOP-BITS T35) for an RTU bus, or (:fd FD).  HANDLER receives
+ON-MODBUS-SLAVE-WRITE for register writes.  Returns a modbus-slave."
   (let* ((slave (make-instance 'modbus-slave :context context :handler handler))
          (id (register-lws-object slave))
          (ok nil))
     (setf (modbus-slave-id slave) id)
     (unwind-protect
          (progn
-           (ecase (first transport)
-             (:tcp-listen
-              (destructuring-bind (port &key iface) (rest transport)
-                (%call-with-tcp-transport
-                 port iface
-                 #'(lambda (transport)
-                     (let ((engine (%csmb-slave-create
-                                    (lws-context-ctx context)
-                                    (lws-context-protocols-ptr context)
-                                    transport
-                                    (cffi:callback csmb-notify)
-                                    (cffi:make-pointer id))))
-                       (when (cffi:null-pointer-p engine)
-                         (error "modbus-slave-open: csmb_slave_create failed"))
-                       (setf (modbus-slave-engine-ptr slave) engine)))))))
+           (%call-with-transport
+            transport
+            #'(lambda (transport)
+                (let ((engine (%csmb-slave-create
+                               (lws-context-ctx context)
+                               (lws-context-protocols-ptr context)
+                               transport
+                               (cffi:callback csmb-notify)
+                               (cffi:make-pointer id))))
+                  (when (cffi:null-pointer-p engine)
+                    (error "modbus-slave-open: csmb_slave_create failed"))
+                  (setf (modbus-slave-engine-ptr slave) engine))))
            (setf ok t)
            slave)
       (unless ok
@@ -400,29 +444,28 @@ EXCEPTION set) or :unit-timeout.")
 ;;; master public API
 
 (defun modbus-master-open (context transport handler)
-  "Open a Modbus master on CONTEXT.  TRANSPORT is (:tcp HOST PORT).
-HANDLER receives the ON-MODBUS-* events.  Returns a modbus-master."
+  "Open a Modbus master on CONTEXT.  TRANSPORT is (:tcp HOST PORT),
+(:serial DEVICE &key BAUD PARITY DATA-BITS STOP-BITS T35) for an RTU line,
+or (:fd FD).  HANDLER receives the ON-MODBUS-* events.  Returns a
+modbus-master."
   (let* ((master (make-instance 'modbus-master :context context :handler handler))
          (id (register-lws-object master))
          (ok nil))
     (setf (modbus-master-id master) id)
     (unwind-protect
          (progn
-           (ecase (first transport)
-             (:tcp
-              (destructuring-bind (host port) (rest transport)
-                (%call-with-tcp-transport
-                 port host
-                 #'(lambda (transport)
-                     (let ((engine (%csmb-master-create
-                                    (lws-context-ctx context)
-                                    (lws-context-client-vhost context)
-                                    transport
-                                    (cffi:callback csmb-notify)
-                                    (cffi:make-pointer id))))
-                       (when (cffi:null-pointer-p engine)
-                         (error "modbus-master-open: csmb_master_create failed"))
-                       (setf (modbus-master-engine-ptr master) engine)))))))
+           (%call-with-transport
+            transport
+            #'(lambda (transport)
+                (let ((engine (%csmb-master-create
+                               (lws-context-ctx context)
+                               (lws-context-client-vhost context)
+                               transport
+                               (cffi:callback csmb-notify)
+                               (cffi:make-pointer id))))
+                  (when (cffi:null-pointer-p engine)
+                    (error "modbus-master-open: csmb_master_create failed"))
+                  (setf (modbus-master-engine-ptr master) engine))))
            (setf ok t)
            master)
       (unless ok

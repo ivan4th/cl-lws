@@ -94,6 +94,22 @@ static void emit_log(csmb_engine *e, uint8_t unit, uint8_t kind, uint8_t fc,
     csmb_event_add(e, &ev, NULL, 0);
 }
 
+#define CSMB_LOG_RATE_US ((csmb_usec_t)5000000)   /* one LOG per (unit,kind)/5s */
+
+/* Rate-limited LOG: at most one per (unit, kind) per CSMB_LOG_RATE_US. */
+static void emit_log_rl(csmb_engine *e, csmb_sched *sc, uint8_t unit,
+                        uint8_t kind, uint8_t fc, uint8_t exc, csmb_usec_t now)
+{
+    csmb_sunit *u = csmb_sched_find_unit(sc, unit);
+
+    if (u && kind < 3) {
+        if (u->last_log_us[kind] != 0 && now - u->last_log_us[kind] < CSMB_LOG_RATE_US)
+            return;
+        u->last_log_us[kind] = now ? now : 1;   /* 0 means "never logged" */
+    }
+    emit_log(e, unit, kind, fc, exc);
+}
+
 /* ---- units ---- */
 
 csmb_sunit *csmb_sched_find_unit(csmb_sched *sc, uint8_t unit)
@@ -730,7 +746,8 @@ static void handle_write_response(csmb_engine *e, csmb_sched *sc,
 }
 
 void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
-                            const csmb_pending *p, const csmb_response *r)
+                            const csmb_pending *p, const csmb_response *r,
+                            csmb_usec_t now)
 {
     csmb_sunit *u = csmb_sched_find_unit(sc, p->unit);
     csmb_span *sp;
@@ -759,7 +776,7 @@ void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
     if (r->exception) {
         /* the unit answered (it stays online) but the read failed: the
          * spans this read covers have no fresh data and go stale */
-        emit_log(e, p->unit, CSMB_LOG_EXCEPTION, p->fc, r->exception);
+        emit_log_rl(e, sc, p->unit, CSMB_LOG_EXCEPTION, p->fc, r->exception, now);
         for (sp = sc->spans; sp; sp = sp->next) {
             if (sp->unit != p->unit || sp->reg_type != p->reg_type)
                 continue;
@@ -804,7 +821,8 @@ void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
 }
 
 void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
-                                  const csmb_pending *p, int wr_status)
+                                  const csmb_pending *p, int wr_status,
+                                  csmb_usec_t now)
 {
     if (p->kind == CSMB_PICK_WRITE) {
         csmb_write_op *op = sc->wq_head;
@@ -817,10 +835,9 @@ void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
     } else {
         csmb_sunit *u = csmb_sched_find_unit(sc, p->unit);
 
-        if (u && !u->failing) {
+        if (u)
             u->failing = 1;
-            emit_log(e, p->unit, CSMB_LOG_UNIT_TIMEOUT, p->fc, 0);
-        }
+        emit_log_rl(e, sc, p->unit, CSMB_LOG_UNIT_TIMEOUT, p->fc, 0, now);
     }
 }
 

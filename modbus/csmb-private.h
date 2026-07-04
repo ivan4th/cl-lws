@@ -250,9 +250,10 @@ uint8_t csmb_image_write_range(csmb_image *img, uint8_t unit, int reg_type,
  * pointers; the .c files that touch them include libwebsockets.h. */
 
 typedef enum csmb_conn_role {
-    CSMB_CONN_SLAVE_CHILD = 1,  /* accepted TCP connection served by a slave */
-    CSMB_CONN_MASTER_TCP  = 2,  /* master's outgoing TCP connection (later) */
-    CSMB_CONN_SERIAL      = 3   /* serial / fd RTU connection (later) */
+    CSMB_CONN_SLAVE_CHILD   = 1,  /* accepted TCP connection served by a slave */
+    CSMB_CONN_MASTER_TCP    = 2,  /* master's outgoing TCP connection */
+    CSMB_CONN_MASTER_SERIAL = 3,  /* master's serial/fd RTU connection */
+    CSMB_CONN_SLAVE_SERIAL  = 4   /* slave's serial/fd RTU bus */
 } csmb_conn_role_t;
 
 /* One queued tx chunk with LWS_PRE headroom ahead of the payload. */
@@ -267,11 +268,19 @@ typedef struct csmb_conn {
     int role;                  /* csmb_conn_role_t */
     void *owner;               /* csmb_slave* / csmb_master*; NULL if detached */
     struct lws *wsi;
+    int fd;                    /* serial/file fd (engine-owned); -1 for sockets */
     csmb_txbuf *tx_head, *tx_tail;
     int close_requested;       /* close once the tx queue drains */
-    csmb_mbap_parser mbap;     /* Modbus/TCP framing */
+    csmb_mbap_parser mbap;     /* Modbus/TCP framing (TCP conns) */
+    csmb_rtu_parser rtu;       /* Modbus/RTU framing (serial conns) */
     struct csmb_conn *next;    /* owner's connection list */
 } csmb_conn;
+
+static inline int csmb_conn_is_serial(const csmb_conn *conn)
+{
+    return conn->role == CSMB_CONN_MASTER_SERIAL ||
+           conn->role == CSMB_CONN_SLAVE_SERIAL;
+}
 
 /* Enqueue LEN bytes (copied, with LWS_PRE headroom) and request a
  * writable callback.  Returns CSMB_OK or CSMB_ENOMEM. */
@@ -319,6 +328,31 @@ void csmb_slave_detach_conn(csmb_slave *s, csmb_conn *conn);
 csmb_conn *csmb_transport_connect(struct lws_context *cx,
                                   struct lws_vhost *client_vhost,
                                   const csmb_transport *tr, void *owner);
+
+/* ---- serial / fd RTU transport (csmb-transport.c) ---- */
+
+/* Open TR->host_or_device and put it in raw termios mode (baud/parity/
+ * data/stop from TR, cfmakeraw base, VMIN=1 VTIME=0).  Returns the fd or
+ * -1.  cfsetspeed failures (e.g. on a pty) are logged and tolerated. */
+int csmb_serial_open(const csmb_transport *tr);
+
+/* RTU inter-frame gap (t3.5) in microseconds: TR->t35_us, or derived from
+ * the baud (3.5 char times, floor 1750us) when 0. */
+uint32_t csmb_serial_t35_us(const csmb_transport *tr);
+
+/* Adopt an already-open fd as a raw-file wsi bound to "cs-modbus" on
+ * VHOST; the returned csmb_conn (role, OWNER, fd, an RTU parser in
+ * SLAVE_MODE or master mode) is the wsi's opaque user data.  NULL on
+ * failure (the caller still owns FD). */
+csmb_conn *csmb_transport_adopt_fd(struct lws_vhost *vhost, int fd, int role,
+                                   void *owner, int slave_mode);
+
+/* Create a non-listening vhost (for serial fd adoption) carrying the
+ * "cs-modbus" protocol; OWNER goes in the vhost user pointer.  Stored in
+ * LN (reusing the listener struct).  CSMB_OK / CSMB_ENOMEM / CSMB_ETRANSPORT. */
+int csmb_transport_serial_vhost(csmb_listener *ln, struct lws_context *cx,
+                                const struct lws_protocols *protocols,
+                                void *owner);
 
 /* ---- master scheduler (csmb-sched.c) ----
  *
@@ -375,6 +409,7 @@ typedef struct csmb_sunit {
     size_t   poll_seq_n[CSMB_NUM_REG_TYPES];
     int      online;       /* has answered since the last stale/offline */
     int      failing;      /* last request to it failed (deprioritise) */
+    csmb_usec_t last_log_us[3];  /* last LOG emit time per csmb_log_kind (1..2) */
 } csmb_sunit;
 
 /* One read request in the built poll program. */
@@ -451,15 +486,17 @@ int  csmb_sched_pick(csmb_sched *sc, csmb_pending *p);
 /* Apply a well-formed response to the pending request: marks the unit
  * online (republishing on recovery), advances/completes write ops, and
  * runs change detection emitting SPAN_UPDATE / SPAN_STATE / WRITE_DONE /
- * UNIT_STATE events on E. */
+ * UNIT_STATE events on E.  NOW (usec) rate-limits any exception LOG. */
 void csmb_sched_on_response(csmb_engine *e, csmb_sched *sc,
-                            const csmb_pending *p, const csmb_response *r);
+                            const csmb_pending *p, const csmb_response *r,
+                            csmb_usec_t now);
 
 /* A pending request got no usable answer (response timeout / connection
- * error).  Reads mark the unit failing (and emit a one-shot LOG); a write
- * op fails with WR_STATUS. */
+ * error).  Reads mark the unit failing (and emit a rate-limited LOG); a
+ * write op fails with WR_STATUS.  NOW (usec) rate-limits the LOG. */
 void csmb_sched_on_request_failed(csmb_engine *e, csmb_sched *sc,
-                                  const csmb_pending *p, int wr_status);
+                                  const csmb_pending *p, int wr_status,
+                                  csmb_usec_t now);
 
 /* The per-unit stale timer fired: the unit's spans go STALE and it goes
  * offline (values cleared so recovery republishes). */

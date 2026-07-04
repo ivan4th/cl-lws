@@ -1,17 +1,21 @@
-/* Master engine: one outgoing TCP connection with reconnect/backoff, a
- * heartbeat-driven poll pump over the scheduler, response timeouts,
- * per-unit staleness timers and event emission.
+/* Master engine: one outgoing connection (TCP, serial or fd) with
+ * reconnect/backoff, a heartbeat-driven poll pump over the scheduler,
+ * response timeouts, per-unit staleness timers and event emission.
  *
  * A csmb_master begins with a csmb_engine header (csmb_events_get/done
  * cast through it).  All logic (span store, bunching, change detection,
  * write FIFO) lives in the pure csmb_sched; this file owns the lws
- * transport and timers and drives the scheduler. */
+ * transport and timers and drives the scheduler.  TCP frames carry an
+ * MBAP header (responses matched by transaction id); serial/fd frames are
+ * RTU (no tid, responses matched by unit + function code). */
 
 #include <libwebsockets.h>
+#include <unistd.h>
 #include "csmb-private.h"
 
 #define CSMB_BACKOFF_MIN_MS 500
 #define CSMB_BACKOFF_MAX_MS 8000
+#define CSMB_DEADPEER_TIMEOUTS 5   /* consecutive timeouts -> drop the conn */
 
 typedef struct csmb_stale_timer {
     struct lws_sorted_usec_list sul;
@@ -34,11 +38,13 @@ struct csmb_master {
     struct lws_sorted_usec_list heartbeat_sul;
     struct lws_sorted_usec_list resp_sul;
     struct lws_sorted_usec_list pace_sul;
+    struct lws_sorted_usec_list t35_sul;         /* serial RTU idle-gap resync */
     csmb_stale_timer stale[256];
 
     uint32_t backoff_ms;
     uint32_t heartbeat_ms;
     uint32_t response_timeout_ms;
+    uint32_t t35_us;                 /* serial inter-frame gap */
 
     lws_usec_t pace_until;
 
@@ -47,6 +53,7 @@ struct csmb_master {
     uint16_t next_tid;
     csmb_pending pending;
     int round_active;
+    int timeout_streak;              /* consecutive response timeouts */
 };
 
 /* ---- forward decls ---- */
@@ -55,6 +62,10 @@ static void master_pump(csmb_master *m);
 static void start_connect(csmb_master *m);
 static void schedule_reconnect(csmb_master *m);
 static void master_go_down(csmb_master *m, uint8_t cerr);
+static void master_go_online(csmb_master *m);
+static void master_force_close(csmb_master *m, uint8_t cerr);
+static void resp_cb(struct lws_sorted_usec_list *sul);
+static void pace_cb(struct lws_sorted_usec_list *sul);
 
 /* ---- event helpers ---- */
 
@@ -106,15 +117,21 @@ static void cancel_all_stale(csmb_master *m)
         }
 }
 
-/* ---- request pump ---- */
+static void master_t35_cb(struct lws_sorted_usec_list *sul)
+{
+    csmb_master *m = lws_container_of(sul, csmb_master, t35_sul);
 
-static void resp_cb(struct lws_sorted_usec_list *sul);
-static void pace_cb(struct lws_sorted_usec_list *sul);
+    if (m->conn && csmb_conn_is_serial(m->conn))
+        csmb_rtu_parser_reset(&m->conn->rtu);
+}
+
+/* ---- request pump ---- */
 
 static void master_pump(csmb_master *m)
 {
     lws_usec_t now;
-    int k;
+    int k, serial;
+    uint32_t delay_us;
 
     if (m->engine.destroyed || m->conn_state != CSMB_CONN_ONLINE ||
         m->in_flight || !m->conn)
@@ -133,12 +150,21 @@ static void master_pump(csmb_master *m)
         return;
     }
 
-    {
+    serial = csmb_conn_is_serial(m->conn);
+    if (serial) {
+        uint8_t frame[1 + CSMB_MAX_PDU + 2];
+        int flen;
+
+        memcpy(frame + 1, m->pending.pdu, m->pending.plen);
+        flen = csmb_rtu_wrap(frame, m->pending.unit, m->pending.plen);
+        if (flen < 0)
+            return;
+        m->in_flight = 1;
+        csmb_conn_send(m->conn, frame, (size_t)flen);
+    } else {
         uint8_t frame[CSMB_MBAP_LEN + CSMB_MAX_PDU];
         int flen;
         uint16_t tid = m->next_tid++;
-        csmb_sunit *u;
-        uint32_t delay;
 
         memcpy(frame + CSMB_MBAP_LEN, m->pending.pdu, m->pending.plen);
         flen = csmb_mbap_wrap(frame, tid, m->pending.unit, m->pending.plen);
@@ -147,14 +173,20 @@ static void master_pump(csmb_master *m)
         m->cur_tid = tid;
         m->in_flight = 1;
         csmb_conn_send(m->conn, frame, (size_t)flen);
-        arm_stale_if_needed(m, m->pending.unit);
-        lws_sul_schedule(m->engine.cx, 0, &m->resp_sul, resp_cb,
-                         (lws_usec_t)m->response_timeout_ms * 1000);
-
-        u = csmb_sched_find_unit(&m->sched, m->pending.unit);
-        delay = u ? u->request_delay_ms : 0;
-        m->pace_until = lws_now_usecs() + (lws_usec_t)delay * 1000;
     }
+
+    arm_stale_if_needed(m, m->pending.unit);
+    lws_sul_schedule(m->engine.cx, 0, &m->resp_sul, resp_cb,
+                     (lws_usec_t)m->response_timeout_ms * 1000);
+
+    {
+        csmb_sunit *u = csmb_sched_find_unit(&m->sched, m->pending.unit);
+
+        delay_us = (u ? u->request_delay_ms : 0) * 1000;
+        if (serial && m->t35_us > delay_us)
+            delay_us = m->t35_us;   /* keep a t3.5 gap between frames */
+    }
+    m->pace_until = lws_now_usecs() + (lws_usec_t)delay_us;
 }
 
 static void master_kick(csmb_master *m)
@@ -175,10 +207,15 @@ static void resp_cb(struct lws_sorted_usec_list *sul)
     if (!m->in_flight)
         return;
     m->in_flight = 0;
+    m->timeout_streak++;
     csmb_sched_on_request_failed(&m->engine, &m->sched, &m->pending,
                                  m->pending.kind == CSMB_PICK_WRITE
-                                 ? CSMB_WR_TIMEOUT : 0);
-    master_pump(m);
+                                 ? CSMB_WR_TIMEOUT : 0, lws_now_usecs());
+    /* dead peer: no valid frame at all across several timeouts -> drop */
+    if (m->timeout_streak >= CSMB_DEADPEER_TIMEOUTS)
+        master_force_close(m, CSMB_CERR_TIMEOUT);
+    else
+        master_pump(m);
     csmb_event_flush(&m->engine);
 }
 
@@ -220,15 +257,41 @@ static void start_connect(csmb_master *m)
         return;
     m->conn_state = CSMB_CONN_CONNECTING;
     emit_conn_state(m, CSMB_CONN_CONNECTING, CSMB_CERR_NONE);
-    m->conn = csmb_transport_connect(m->engine.cx, m->client_vhost, &m->tr, m);
-    if (!m->conn)
-        master_go_down(m, CSMB_CERR_CONNECT_FAILED);
+
+    if (m->tr.kind == CSMB_TR_TCP) {
+        m->conn = csmb_transport_connect(m->engine.cx, m->client_vhost, &m->tr, m);
+        if (!m->conn)
+            master_go_down(m, CSMB_CERR_CONNECT_FAILED);
+        return;   /* else wait for RAW_CONNECTED / CLIENT_CONNECTION_ERROR */
+    }
+
+    /* serial / fd: adopt the descriptor, then go online at once (there is
+     * no RAW_CONNECTED for raw files) */
+    {
+        int fd = (m->tr.kind == CSMB_TR_FD) ? m->tr.fd : csmb_serial_open(&m->tr);
+
+        if (fd < 0) {
+            master_go_down(m, CSMB_CERR_CONNECT_FAILED);
+            return;
+        }
+        m->conn = csmb_transport_adopt_fd(m->client_vhost, fd,
+                                          CSMB_CONN_MASTER_SERIAL, m, 0);
+        if (!m->conn) {
+            close(fd);
+            master_go_down(m, CSMB_CERR_CONNECT_FAILED);
+            return;
+        }
+        m->t35_us = csmb_serial_t35_us(&m->tr);
+        master_go_online(m);
+    }
 }
 
 static void schedule_reconnect(csmb_master *m)
 {
     if (m->engine.destroyed)
         return;
+    if (m->tr.kind == CSMB_TR_FD)
+        return;   /* a handed-over fd cannot be reopened: stay offline */
     if (m->backoff_ms == 0)
         m->backoff_ms = CSMB_BACKOFF_MIN_MS;
     else
@@ -248,25 +311,47 @@ static void master_go_down(csmb_master *m, uint8_t cerr)
     m->in_flight = 0;
     m->round_active = 0;
     m->pace_until = 0;
+    m->timeout_streak = 0;
     lws_sul_cancel(&m->resp_sul);
     lws_sul_cancel(&m->pace_sul);
     lws_sul_cancel(&m->heartbeat_sul);
+    lws_sul_cancel(&m->t35_sul);
     cancel_all_stale(m);
     schedule_reconnect(m);
 }
 
-void csmb_master_on_connected(csmb_master *m, struct lws *wsi)
+static void master_go_online(csmb_master *m)
 {
-    (void)wsi;
     m->conn_state = CSMB_CONN_ONLINE;
     emit_conn_state(m, CSMB_CONN_ONLINE, CSMB_CERR_NONE);
     m->backoff_ms = 0;
+    m->timeout_streak = 0;
     csmb_sched_connection_up(&m->sched);
     lws_sul_schedule(m->engine.cx, 0, &m->heartbeat_sul, heartbeat_cb,
                      (lws_usec_t)m->heartbeat_ms * 1000);
     m->round_active = 1;
     csmb_sched_start_round(&m->engine, &m->sched);
     master_pump(m);
+}
+
+/* Tear down the current connection ourselves (dead peer) and reconnect. */
+static void master_force_close(csmb_master *m, uint8_t cerr)
+{
+    struct lws *wsi = m->conn ? m->conn->wsi : NULL;
+
+    if (m->conn) {
+        m->conn->owner = NULL;   /* detach: RAW_CLOSE just frees the conn */
+        m->conn = NULL;
+    }
+    master_go_down(m, cerr);
+    if (wsi)
+        lws_set_timeout(wsi, PENDING_TIMEOUT_HTTP_CONTENT, LWS_TO_KILL_ASYNC);
+}
+
+void csmb_master_on_connected(csmb_master *m, struct lws *wsi)
+{
+    (void)wsi;
+    master_go_online(m);
 }
 
 void csmb_master_on_connect_error(csmb_master *m)
@@ -284,33 +369,71 @@ void csmb_master_on_closed(csmb_master *m)
 int csmb_master_on_rx(csmb_master *m, const uint8_t *buf, size_t len)
 {
     const uint8_t *in = buf;
-    int processed = 0;
+    int processed = 0, serial;
 
     if (!m->conn)
         return 0;
+    serial = csmb_conn_is_serial(m->conn);
+    if (serial)
+        lws_sul_schedule(m->engine.cx, 0, &m->t35_sul, master_t35_cb,
+                         (lws_usec_t)m->t35_us);
+
     while (len > 0) {
-        csmb_parse_ret pr = csmb_mbap_parser_feed(&m->conn->mbap, &in, &len);
+        csmb_parse_ret pr;
+        const uint8_t *r_pdu;
+        uint16_t r_plen;
+        uint8_t r_unit;
+        int match;
 
-        if (pr == CSMB_PR_NEED_MORE)
-            break;
-        if (pr == CSMB_PR_BAD)
-            return -1;   /* desync: close and reconnect */
+        if (serial) {
+            pr = csmb_rtu_parser_feed(&m->conn->rtu, &in, &len);
+            if (pr == CSMB_PR_NEED_MORE)
+                break;
+            if (pr == CSMB_PR_BAD) {
+                csmb_rtu_parser_reset(&m->conn->rtu);   /* resync on t3.5 */
+                continue;
+            }
+            r_pdu = m->conn->rtu.pdu;
+            r_plen = m->conn->rtu.plen;
+            r_unit = m->conn->rtu.unit;
+            /* RTU has no tid: match on unit + function code */
+            match = m->in_flight && r_unit == m->pending.unit &&
+                    r_plen > 0 && (r_pdu[0] & 0x7f) == m->pending.fc;
+        } else {
+            pr = csmb_mbap_parser_feed(&m->conn->mbap, &in, &len);
+            if (pr == CSMB_PR_NEED_MORE)
+                break;
+            if (pr == CSMB_PR_BAD)
+                return -1;   /* desync: close and reconnect */
+            r_pdu = m->conn->mbap.pdu;
+            r_plen = m->conn->mbap.plen;
+            r_unit = m->conn->mbap.unit;
+            match = m->in_flight && m->conn->mbap.tid == m->cur_tid &&
+                    r_unit == m->pending.unit;
+        }
 
-        if (m->in_flight && m->conn->mbap.tid == m->cur_tid &&
-            m->conn->mbap.unit == m->pending.unit) {
+        m->timeout_streak = 0;   /* any complete frame proves the peer alive */
+
+        if (match) {
             csmb_response r;
 
-            lws_sul_cancel(&m->resp_sul);
-            m->in_flight = 0;
-            if (csmb_decode_response(m->conn->mbap.pdu, m->conn->mbap.plen,
-                                     m->pending.fc, &r) < 0)
-                return -1;   /* protocol error */
-            reset_stale_timer(m, m->pending.unit);
-            csmb_sched_on_response(&m->engine, &m->sched, &m->pending, &r);
-            processed = 1;
+            if (csmb_decode_response(r_pdu, r_plen, m->pending.fc, &r) >= 0) {
+                lws_sul_cancel(&m->resp_sul);
+                m->in_flight = 0;
+                reset_stale_timer(m, m->pending.unit);
+                csmb_sched_on_response(&m->engine, &m->sched, &m->pending, &r,
+                                       lws_now_usecs());
+                processed = 1;
+            } else if (!serial) {
+                return -1;   /* TCP: a matched but malformed response is a desync */
+            }
+            /* serial: ignore the malformed frame, wait for the timeout */
         }
-        /* else: unexpected frame -> drop */
-        csmb_mbap_parser_reset(&m->conn->mbap);
+
+        if (serial)
+            csmb_rtu_parser_reset(&m->conn->rtu);
+        else
+            csmb_mbap_parser_reset(&m->conn->mbap);
     }
     if (processed)
         master_pump(m);
@@ -327,8 +450,9 @@ csmb_master *csmb_master_create(struct lws_context *cx,
     csmb_master *m;
     int i;
 
-    if (tr->kind != CSMB_TR_TCP)
-        return NULL;   /* serial / fd master is a later stage */
+    if (tr->kind != CSMB_TR_TCP && tr->kind != CSMB_TR_SERIAL &&
+        tr->kind != CSMB_TR_FD)
+        return NULL;
 
     m = calloc(1, sizeof(*m));
     if (!m)
@@ -371,6 +495,7 @@ void csmb_master_destroy(csmb_master *m)
     lws_sul_cancel(&m->heartbeat_sul);
     lws_sul_cancel(&m->resp_sul);
     lws_sul_cancel(&m->pace_sul);
+    lws_sul_cancel(&m->t35_sul);
     cancel_all_stale(m);
     if (m->conn) {
         m->conn->owner = NULL;

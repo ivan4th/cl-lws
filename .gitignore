@@ -23,4 +23,7 @@ modbus/tests/test-event
 modbus/tests/test-codec
 modbus/tests/test-sched
 modbus/tests/test-image
+modbus/tests/fuzz-mbap
+modbus/tests/fuzz-rtu
+modbus/tests/fuzz-request
 modbus/tests/*.dSYM/

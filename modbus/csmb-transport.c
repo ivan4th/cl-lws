@@ -1,9 +1,11 @@
 /* Shared transport glue: per-connection tx queue (one lws_write per
- * WRITEABLE, partial-write handling) and the slave listener vhost.
- * Serial / fd transports and the master client connect land here in a
- * later stage. */
+ * WRITEABLE, partial-write handling), the slave listener vhost, the
+ * master TCP client connect, and the serial/fd RTU transport. */
 
 #include <libwebsockets.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 #include "csmb-private.h"
 
 /* ---- per-connection tx queue ---- */
@@ -66,6 +68,9 @@ void csmb_conn_free(csmb_conn *conn)
         free(b);
         b = bn;
     }
+    /* serial/fd conns own their descriptor (lws does not close raw files) */
+    if (csmb_conn_is_serial(conn) && conn->fd >= 0)
+        close(conn->fd);
     free(conn);
 }
 
@@ -148,6 +153,7 @@ csmb_conn *csmb_transport_connect(struct lws_context *cx,
         return NULL;
     conn->role = CSMB_CONN_MASTER_TCP;
     conn->owner = owner;
+    conn->fd = -1;
     csmb_mbap_parser_init(&conn->mbap);
 
     memset(&info, 0, sizeof(info));
@@ -169,4 +175,142 @@ csmb_conn *csmb_transport_connect(struct lws_context *cx,
     conn->wsi = wsi;
     lws_set_opaque_user_data(wsi, conn);
     return conn;
+}
+
+/* ---- serial / fd RTU transport ---- */
+
+static speed_t baud_to_speed(int baud)
+{
+    switch (baud) {
+    case 1200:   return B1200;
+    case 2400:   return B2400;
+    case 4800:   return B4800;
+    case 9600:   return B9600;
+    case 19200:  return B19200;
+    case 38400:  return B38400;
+    case 57600:  return B57600;
+    case 115200: return B115200;
+    case 230400: return B230400;
+    default:     return B9600;
+    }
+}
+
+int csmb_serial_open(const csmb_transport *tr)
+{
+    int fd, baud = tr->baud ? tr->baud : 9600;
+    speed_t sp = baud_to_speed(baud);
+    struct termios tio;
+
+    if (!tr->host_or_device)
+        return -1;
+    fd = open(tr->host_or_device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+
+    if (tcgetattr(fd, &tio) == 0) {
+        cfmakeraw(&tio);
+        /* a pty may reject baud changes; tolerate it (log + continue) */
+        if (cfsetispeed(&tio, sp) != 0 || cfsetospeed(&tio, sp) != 0)
+            lwsl_warn("csmb: cfsetspeed(%d) failed on %s, continuing\n",
+                      baud, tr->host_or_device);
+        tio.c_cflag &= ~(tcflag_t)CSIZE;
+        tio.c_cflag |= (tr->data_bits == 7) ? CS7 : CS8;
+        if (tr->parity == CSMB_PARITY_NONE) {
+            tio.c_cflag &= ~(tcflag_t)PARENB;
+        } else {
+            tio.c_cflag |= PARENB;
+            if (tr->parity == CSMB_PARITY_ODD)
+                tio.c_cflag |= PARODD;
+            else
+                tio.c_cflag &= ~(tcflag_t)PARODD;
+        }
+        if (tr->stop_bits == 2)
+            tio.c_cflag |= CSTOPB;
+        else
+            tio.c_cflag &= ~(tcflag_t)CSTOPB;
+        tio.c_cflag |= CLOCAL | CREAD;
+        tio.c_cc[VMIN] = 1;
+        tio.c_cc[VTIME] = 0;
+        if (tcsetattr(fd, TCSANOW, &tio) != 0)
+            lwsl_warn("csmb: tcsetattr failed on %s, continuing\n",
+                      tr->host_or_device);
+        tcflush(fd, TCIOFLUSH);
+    } else {
+        lwsl_warn("csmb: tcgetattr failed on %s, continuing raw\n",
+                  tr->host_or_device);
+    }
+    return fd;
+}
+
+uint32_t csmb_serial_t35_us(const csmb_transport *tr)
+{
+    int baud;
+    uint64_t us;
+
+    if (tr->t35_us)
+        return tr->t35_us;
+    baud = tr->baud ? tr->baud : 9600;
+    /* 3.5 characters * ~11 bits = 38.5 bits; us = 38.5e6 / baud */
+    us = (uint64_t)38500000 / (uint64_t)baud;
+    if (us < 1750)
+        us = 1750;
+    return (uint32_t)us;
+}
+
+csmb_conn *csmb_transport_adopt_fd(struct lws_vhost *vhost, int fd, int role,
+                                   void *owner, int slave_mode)
+{
+    lws_sock_file_fd_type u;
+    struct lws *wsi;
+    csmb_conn *conn = calloc(1, sizeof(*conn));
+
+    if (!conn)
+        return NULL;
+    conn->role = role;
+    conn->owner = owner;
+    conn->fd = fd;
+    csmb_rtu_parser_init(&conn->rtu, slave_mode);
+
+    memset(&u, 0, sizeof(u));
+    u.filefd = (lws_filefd_type)(long long)fd;
+    wsi = lws_adopt_descriptor_vhost(vhost, LWS_ADOPT_RAW_FILE_DESC, u,
+                                     "cs-modbus", NULL);
+    if (!wsi) {
+        free(conn);
+        return NULL;
+    }
+    conn->wsi = wsi;
+    lws_set_opaque_user_data(wsi, conn);
+    return conn;
+}
+
+int csmb_transport_serial_vhost(csmb_listener *ln, struct lws_context *cx,
+                                const struct lws_protocols *protocols,
+                                void *owner)
+{
+    static unsigned seq;
+    struct lws_context_creation_info info;
+    char namebuf[48];
+
+    memset(ln, 0, sizeof(*ln));
+    snprintf(namebuf, sizeof(namebuf), "csmb-serial-%u", ++seq);
+    ln->vhost_name = strdup(namebuf);
+    ln->proto_str = strdup("cs-modbus");
+    if (!ln->vhost_name || !ln->proto_str) {
+        csmb_transport_listen_close(ln);
+        return CSMB_ENOMEM;
+    }
+
+    memset(&info, 0, sizeof(info));
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    info.vhost_name = ln->vhost_name;
+    info.user = owner;
+
+    ln->vhost = lws_create_vhost(cx, &info);
+    if (!ln->vhost) {
+        csmb_transport_listen_close(ln);
+        return CSMB_ETRANSPORT;
+    }
+    return CSMB_OK;
 }

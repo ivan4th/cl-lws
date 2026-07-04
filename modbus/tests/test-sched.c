@@ -121,7 +121,7 @@ static void one_read(csmb_engine *e, csmb_sched *sc, int rt,
     TCHECK_EQ(p.reg_type, rt);
     TCHECK_EQ(p.count, count);
     r = resp_read(rt, vals, count);
-    csmb_sched_on_response(e, sc, &p, &r);
+    csmb_sched_on_response(e, sc, &p, &r, 0);
 }
 
 /* ---- bunching ---- */
@@ -333,7 +333,7 @@ static void test_write_ok(void)
     TCHECK_EQ(p.fc, CSMB_FC_WRITE_SINGLE_REG);
     TCHECK_EQ(p.op_id, op);
     r = resp_echo(CSMB_FC_WRITE_SINGLE_REG, 5, 4242);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     ev = nth_type(CSMB_EV_WRITE_DONE, 0);
     TCHECK(ev != NULL);
@@ -347,7 +347,7 @@ static void test_write_ok(void)
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     TCHECK_EQ(p.fc, CSMB_FC_WRITE_MULTI_REGS);
     r = resp_echo(CSMB_FC_WRITE_MULTI_REGS, 10, 3);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_WRITE_DONE, 0)->state, CSMB_WR_OK);
 
@@ -358,13 +358,13 @@ static void test_write_ok(void)
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     TCHECK_EQ(p.req_index, 0);
     r = resp_echo(CSMB_FC_WRITE_SINGLE_REG, 5, 100);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     TCHECK_EQ(count_type(CSMB_EV_WRITE_DONE), 0);
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     TCHECK_EQ(p.req_index, 1);
     r = resp_echo(CSMB_FC_WRITE_SINGLE_REG, 6, 200);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_WRITE_DONE, 0)->state, CSMB_WR_OK);
 
@@ -393,7 +393,7 @@ static void test_write_errors(void)
     csmb_sched_enqueue_write(&sc, 1, specs, 1);
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     r = resp_exc(CSMB_FC_WRITE_SINGLE_REG, CSMB_EXC_ILLEGAL_ADDRESS);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     ev = nth_type(CSMB_EV_WRITE_DONE, 0);
     TCHECK(ev != NULL);
@@ -404,7 +404,7 @@ static void test_write_errors(void)
     csmb_sched_enqueue_write(&sc, 1, specs, 1);
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     r = resp_echo(CSMB_FC_WRITE_SINGLE_REG, 5, 999);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_WRITE_DONE, 0)->state, CSMB_WR_VERIFY_FAILED);
 
@@ -412,7 +412,7 @@ static void test_write_errors(void)
     csmb_sched_enqueue_write(&sc, 2, specs, 1);
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     r = resp_echo(CSMB_FC_WRITE_SINGLE_REG, 5, 999);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_WRITE_DONE, 0)->state, CSMB_WR_OK);
 
@@ -421,7 +421,7 @@ static void test_write_errors(void)
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_WRITE);
     TCHECK_EQ(p.fc, CSMB_FC_WRITE_MULTI_REGS);
     r = resp_echo(CSMB_FC_WRITE_MULTI_REGS, 5, 1);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_WRITE_DONE, 0)->state, CSMB_WR_OK);
 
@@ -464,7 +464,7 @@ static void test_write_preempt_and_hold(void)
     /* first pick is still the write (preempts) -> complete it */
     TCHECK_EQ(csmb_sched_pick(&sc, &pw), CSMB_PICK_WRITE);
     r = resp_echo(CSMB_FC_WRITE_MULTI_REGS, 30, 2);
-    csmb_sched_on_response(&e, &sc, &pw, &r);
+    csmb_sched_on_response(&e, &sc, &pw, &r, 0);
     capture(&e);
     TCHECK_EQ(nth_type(CSMB_EV_WRITE_DONE, 0)->state, CSMB_WR_OK);
 
@@ -475,7 +475,7 @@ static void test_write_preempt_and_hold(void)
     specs[0] = wspec(CSMB_HOLDING, 30, 2, two);
     csmb_sched_enqueue_write(&sc, 1, specs, 1);
     r = resp_read(CSMB_HOLDING, changed, 2);
-    csmb_sched_on_response(&e, &sc, &pr, &r);   /* held: no span update */
+    csmb_sched_on_response(&e, &sc, &pr, &r, 0);   /* held: no span update */
     capture(&e);
     TCHECK_EQ(count_type(CSMB_EV_SPAN_UPDATE), 0);
 
@@ -519,7 +519,7 @@ static void test_poll_seq_uncovered(void)
     TCHECK_EQ(p.start, 10);
     TCHECK_EQ(p.count, 5);
     r = resp_read(CSMB_HOLDING, five, 5);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     ev = nth_type(CSMB_EV_SPAN_UPDATE, 0);
     TCHECK(ev != NULL);
@@ -667,7 +667,7 @@ static void test_read_exception(void)
     csmb_sched_start_round(&e, &sc);
     TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
     r = resp_exc(rd_fc(CSMB_HOLDING), CSMB_EXC_ILLEGAL_ADDRESS);
-    csmb_sched_on_response(&e, &sc, &p, &r);
+    csmb_sched_on_response(&e, &sc, &p, &r, 0);
     capture(&e);
     /* unit stays online (no UNIT_STATE), span goes stale, log emitted */
     TCHECK_EQ(count_type(CSMB_EV_UNIT_STATE), 0);
