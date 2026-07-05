@@ -1,6 +1,6 @@
 UNAME := $(shell uname -s)
 
-CFLAGS += -O2 -g -fPIC -Wall -Wextra -Werror -std=c99 -I. -I/usr/local/include
+CFLAGS += -O2 -g -fPIC -Wall -Wextra -Werror -std=c99 -I. -I/usr/local/include -D_GNU_SOURCE
 LDFLAGS += -L/usr/local/lib -lwebsockets
 
 ifeq ($(UNAME),Darwin)
