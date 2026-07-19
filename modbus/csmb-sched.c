@@ -214,7 +214,7 @@ static int ranges_intersect(uint16_t a0, uint16_t ac, uint16_t b0, uint16_t bc)
 int32_t csmb_sched_subscribe(csmb_sched *sc, uint8_t unit, int reg_type,
                              uint16_t start, uint16_t count, uint32_t flags)
 {
-    csmb_span *sp, *ns;
+    csmb_span *ns;
 
     if (!reg_type_ok(reg_type))
         return CSMB_EBADTYPE;
@@ -223,14 +223,12 @@ int32_t csmb_sched_subscribe(csmb_sched *sc, uint8_t unit, int reg_type,
     if (count > reg_max_read(reg_type))
         return CSMB_ETOOBIG;
 
-    for (sp = sc->spans; sp; sp = sp->next) {
-        if (sp->unit != unit || sp->reg_type != reg_type)
-            continue;
-        if (sp->start == start && sp->count == count)
-            continue;   /* identical is allowed (a second view) */
-        if (ranges_intersect(sp->start, sp->count, start, count))
-            return CSMB_EOVERLAP;
-    }
+    /* Overlapping spans are allowed: the poll program merges
+     * intersecting ranges into covering reads (csmb_bunch_ranges) and
+     * every span covered by a completed read step extracts its own
+     * window with per-span change detection.  Real param maps do
+     * contain overlapping register windows (e.g. two 32-bit values
+     * sharing a register). */
     if (!ensure_unit(sc, unit))
         return CSMB_ENOMEM;
 

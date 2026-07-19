@@ -172,7 +172,7 @@ static void test_bunch(void)
     TCHECK_EQ(out[2].start, 100);
 }
 
-/* ---- subscribe / overlap ---- */
+/* ---- subscribe ---- */
 
 static void test_subscribe(void)
 {
@@ -182,7 +182,9 @@ static void test_subscribe(void)
     csmb_sched_init(&sc);
     a = csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 10, 5, 0);
     TCHECK(a > 0);
-    TCHECK_EQ(csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 12, 5, 0), CSMB_EOVERLAP);
+    /* overlapping is allowed (real param maps contain overlapping
+     * register windows; the poll program merges them) */
+    TCHECK(csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 12, 5, 0) > 0);
     b = csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 10, 5, 0);  /* identical ok */
     TCHECK(b > 0 && b != a);
     TCHECK(csmb_sched_subscribe(&sc, 1, CSMB_COIL, 10, 5, 0) > 0);
@@ -194,6 +196,88 @@ static void test_subscribe(void)
     TCHECK_EQ(csmb_sched_unsubscribe(&sc, a), CSMB_OK);
     TCHECK_EQ(csmb_sched_unsubscribe(&sc, a), CSMB_ENOSPAN);
     csmb_sched_free(&sc);
+}
+
+/* ---- overlapping spans ---- */
+
+/* The field case that used to be refused with CSMB_EOVERLAP: two
+ * 32-bit values at ACTL holding 1023 and 1024 share register 1024
+ * (spans [1023,1025) and [1024,1026)).  Both must be polled via one
+ * merged read and get their own values / change detection. */
+static void test_overlapping_spans(void)
+{
+    csmb_sched sc;
+    csmb_engine e;
+    csmb_pending p;
+    int32_t a, b;
+    uint16_t v0[3] = { 11, 22, 33 };
+    uint16_t v1[3] = { 11, 55, 33 };   /* only the shared register changes */
+    uint16_t v2[3] = { 11, 55, 44 };   /* only span B's register changes */
+    struct evrec *ev;
+    int i;
+
+    csmb_sched_init(&sc);
+    csmb_engine_init(&e, NULL, NULL, NULL);
+    csmb_sched_add_unit(&sc, 1, 0, 20000, 0);
+    a = csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 1023, 2, 0);
+    b = csmb_sched_subscribe(&sc, 1, CSMB_HOLDING, 1024, 2, 0);
+    TCHECK(a > 0 && b > 0);
+
+    /* the poll program merges the two spans into one covering read */
+    csmb_sched_start_round(&e, &sc);
+    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
+    TCHECK_EQ(p.start, 1023);
+    TCHECK_EQ(p.count, 3);
+    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_NONE);
+
+    /* first read: both spans online, each publishes its own window */
+    one_read(&e, &sc, CSMB_HOLDING, v0, 3);
+    capture(&e);
+    TCHECK_EQ(count_type(CSMB_EV_SPAN_STATE), 2);
+    TCHECK_EQ(count_type(CSMB_EV_SPAN_UPDATE), 2);
+    for (i = 0; i < 2; i++) {
+        ev = nth_type(CSMB_EV_SPAN_UPDATE, i);
+        TCHECK(ev != NULL);
+        if (ev->span_id == a) {
+            TCHECK_EQ(ev->start, 1023);
+            TCHECK_EQ(ev->vals[0], 11);
+            TCHECK_EQ(ev->vals[1], 22);
+        } else {
+            TCHECK_EQ(ev->span_id, b);
+            TCHECK_EQ(ev->start, 1024);
+            TCHECK_EQ(ev->vals[0], 22);
+            TCHECK_EQ(ev->vals[1], 33);
+        }
+    }
+
+    /* unchanged -> nothing */
+    one_read(&e, &sc, CSMB_HOLDING, v0, 3);
+    capture(&e);
+    TCHECK_EQ(ncap, 0);
+
+    /* the shared register changes -> both spans update */
+    one_read(&e, &sc, CSMB_HOLDING, v1, 3);
+    capture(&e);
+    TCHECK_EQ(count_type(CSMB_EV_SPAN_UPDATE), 2);
+
+    /* a register covered only by span B changes -> only B updates */
+    one_read(&e, &sc, CSMB_HOLDING, v2, 3);
+    capture(&e);
+    TCHECK_EQ(count_type(CSMB_EV_SPAN_UPDATE), 1);
+    ev = nth_type(CSMB_EV_SPAN_UPDATE, 0);
+    TCHECK(ev != NULL);
+    TCHECK_EQ(ev->span_id, b);
+    TCHECK_EQ(ev->vals[1], 44);
+
+    /* unsubscribing one span keeps the other working */
+    TCHECK_EQ(csmb_sched_unsubscribe(&sc, a), CSMB_OK);
+    csmb_sched_start_round(&e, &sc);
+    TCHECK_EQ(csmb_sched_pick(&sc, &p), CSMB_PICK_READ);
+    TCHECK_EQ(p.start, 1024);
+    TCHECK_EQ(p.count, 2);
+
+    csmb_sched_free(&sc);
+    csmb_engine_free(&e);
 }
 
 /* ---- change detection ---- */
@@ -733,7 +817,8 @@ static void test_exception_sibling(void)
     csmb_engine_free(&e);
 }
 
-TEST_MAIN(test_bunch, test_subscribe, test_change_detection,
+TEST_MAIN(test_bunch, test_subscribe, test_overlapping_spans,
+          test_change_detection,
           test_always_and_coils, test_write_ok, test_write_errors,
           test_write_preempt_and_hold, test_poll_seq_uncovered,
           test_enable_disable, test_stale_and_connection, test_exception_sibling)

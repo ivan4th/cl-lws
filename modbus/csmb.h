@@ -100,7 +100,7 @@ typedef enum csmb_exc {
 
 enum {
     CSMB_OK        = 0,
-    CSMB_EOVERLAP  = -1,   /* intersecting span / range */
+    CSMB_EOVERLAP  = -1,   /* intersecting image block range */
     CSMB_ERANGE    = -2,   /* bad start/count */
     CSMB_ENOUNIT   = -3,   /* unknown unit */
     CSMB_EBADTYPE  = -4,   /* e.g. write to a read-only register type */
@@ -252,10 +252,10 @@ int csmb_master_add_unit(csmb_master *m, uint8_t unit,
                          uint32_t stale_timeout_ms, /* 0 = default 20000 */
                          uint32_t flags);
 
-/* Returns a span id (> 0) or a negative error (CSMB_EOVERLAP if the
- * range intersects an existing span of the same unit+reg-type without
- * being identical to it, CSMB_ETOOBIG if it doesn't fit in a single
- * read request). */
+/* Returns a span id (> 0) or a negative error (CSMB_ETOOBIG if the
+ * range doesn't fit in a single read request).  Spans may overlap:
+ * intersecting ranges are merged into covering reads by the poll
+ * program and each span gets its own values / change detection. */
 int32_t csmb_master_subscribe(csmb_master *m, uint8_t unit, int reg_type,
                               uint16_t start, uint16_t count, uint32_t flags);
 int csmb_master_unsubscribe(csmb_master *m, int32_t span_id);
