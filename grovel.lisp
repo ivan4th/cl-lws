@@ -454,6 +454,7 @@
 
 (constant (+lws-pre+ "LWS_PRE"))
 (constant (+lws-server-option-explicit-vhosts+ "LWS_SERVER_OPTION_EXPLICIT_VHOSTS"))
+(constant (+lws-server-option-cpd-bypass+ "LWS_SERVER_OPTION_CPD_BYPASS"))
 (constant (+lws-server-option-adopt-apply-listen-accept-config+
            "LWS_SERVER_OPTION_ADOPT_APPLY_LISTEN_ACCEPT_CONFIG"))
 (constant (+lws-to-kill-async+ "LWS_TO_KILL_ASYNC"))

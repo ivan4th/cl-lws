@@ -63,31 +63,28 @@ state is :connecting; ON-RAW-CONNECTED / ON-RAW-CONNECT-ERROR follow."
                                 (host-str host)
                                 (method-str "RAW")
                                 (protocol-str "cs-raw"))
-      (cffi:with-foreign-object (pwsi :pointer)
-        (setf (cffi:mem-ref pwsi :pointer) (cffi:null-pointer))
-        (with-lws-object (info
-                          (:struct lws-client-connect-info)
-                          context (lws-context-ctx context)
-                          address address-str
-                          host host-str
-                          port port
-                          method method-str
-                          local-protocol-name protocol-str
-                          vhost (lws-context-client-vhost context)
-                          opaque-user-data (cffi:make-pointer id)
-                          pwsi pwsi)
-          (let ((wsi (%lws-client-connect-via-info info)))
-            (cond ((cffi:null-pointer-p wsi)
-                   ;; No wsi was created, so no callbacks will fire;
-                   ;; deliver the error asynchronously to keep the
-                   ;; caller's view consistent.
-                   (setf (raw-connection-state conn) :connect-failed)
-                   (unregister-lws-object id)
-                   (schedule context nil
-                             #'(lambda ()
-                                 (on-raw-connect-error handler conn "connect failed"))))
-                  (t
-                   (setf (raw-connection-wsi conn) wsi)))))))
+      (with-lws-object (info
+                        (:struct lws-client-connect-info)
+                        context (lws-context-ctx context)
+                        address address-str
+                        host host-str
+                        port port
+                        method method-str
+                        local-protocol-name protocol-str
+                        vhost (lws-context-client-vhost context)
+                        opaque-user-data (cffi:make-pointer id))
+        (let ((wsi (%lws-client-connect-via-info info)))
+          (cond ((cffi:null-pointer-p wsi)
+                 ;; No wsi was created, so no callbacks will fire;
+                 ;; deliver the error asynchronously to keep the
+                 ;; caller's view consistent.
+                 (setf (raw-connection-state conn) :connect-failed)
+                 (unregister-lws-object id)
+                 (schedule context nil
+                           #'(lambda ()
+                               (on-raw-connect-error handler conn "connect failed"))))
+                (t
+                 (setf (raw-connection-wsi conn) wsi))))))
     conn))
 
 (defun raw-listen (context port handler &key iface)
@@ -253,3 +250,24 @@ Returns -1 to close the connection, 0 otherwise."
    0))
 
 (register-lws-protocol "cs-raw" #'(lambda () (cffi:callback raw-callback)))
+
+(defun %raw-wsi-destroy (wsi)
+  ;; Backstop for teardown paths that deliver neither
+  ;; CLIENT_CONNECTION_ERROR nor RAW_CLOSE: if the connection still
+  ;; references the wsi being destroyed, invalidate it so nothing
+  ;; pokes lws through a freed pointer, and notify the handler.
+  (let ((conn (wsi-object wsi nil)))
+    (when (and (raw-connection-p conn)
+               (raw-connection-wsi conn)
+               (cffi:pointer-eq (raw-connection-wsi conn) wsi))
+      (let ((connected-p (eq (raw-connection-state conn) :connected)))
+        (setf (raw-connection-state conn) (if connected-p :closed :connect-failed)
+              (raw-connection-wsi conn) nil)
+        (unregister-lws-object (raw-connection-id conn))
+        (cond (connected-p
+               (on-raw-closed (raw-connection-handler conn) conn))
+              (t
+               (on-raw-connect-error (raw-connection-handler conn) conn
+                                     "connection destroyed")))))))
+
+(register-wsi-destroy-handler 'raw #'%raw-wsi-destroy)

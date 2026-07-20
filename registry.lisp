@@ -52,6 +52,30 @@
 (defun set-wsi-object-id (wsi id)
   (%lws-set-opaque-user-data wsi (cffi:make-pointer id)))
 
+;;; wsi destruction catch-all.  LWS_CALLBACK_WSI_DESTROY is delivered
+;;; unconditionally to the default protocol for every wsi lws tears
+;;; down, including paths that skip the role close callbacks (e.g. an
+;;; MQTT network wsi closed by validity timeout without cascading to
+;;; its mux child).  Interested modules register a handler here; the
+;;; handlers must be idempotent no-ops for wsis already cleaned up via
+;;; their normal close callbacks.
+
+(defvar *wsi-destroy-handlers* '()
+  "Alist of (name . function), each function called with the wsi being
+destroyed.  Event loop thread only.")
+
+(defun register-wsi-destroy-handler (name function)
+  (let ((entry (assoc name *wsi-destroy-handlers*)))
+    (cond (entry
+           (setf (cdr entry) function))
+          (t
+           (push (cons name function) *wsi-destroy-handlers*))))
+  (values))
+
+(defun handle-wsi-destroy (wsi)
+  (dolist (entry *wsi-destroy-handlers*)
+    (funcall (cdr entry) wsi)))
+
 ;;; misc foreign helpers
 
 (defun memset (p type &optional (count 1) (val 0))

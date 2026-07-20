@@ -46,6 +46,8 @@
     :pointer
   (info :pointer))
 
+(cffi:defcfun (%lws-get-network-wsi "lws_get_network_wsi") :pointer (wsi :pointer))
+
 (cffi:defcfun (%lws-callback-on-writable "lws_callback_on_writable")
     :int
   (wsi :pointer))

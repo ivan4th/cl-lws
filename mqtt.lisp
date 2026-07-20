@@ -56,10 +56,20 @@
   (op-queue '())
   in-flight
   established-p
+  network-wsi-address ;; see *mqtt-network-wsis*
   ;; rx reassembly state
   rx-topic
   (rx-chunks '())
   rx-retain)
+
+(defvar *mqtt-network-wsis* (make-hash-table)
+  "Maps network wsi pointer address -> mqtt-session.  lws migrates an
+established MQTT stream to a mux child wsi (which is where the session
+callbacks then arrive and where the opaque user data lives), but the
+underlying network wsi can be closed on its own (validity timeout,
+peer FIN / RST) without MQTT_CLIENT_CLOSED reaching the child; this
+map lets the WSI_DESTROY backstop find and clean up the orphaned
+session.  Event loop thread only.")
 
 (defun %mqtt-alloc-string (session string)
   (let ((ptr (cffi:foreign-string-alloc string)))
@@ -169,6 +179,8 @@ are called on the event loop thread."
     (setf (mqtt-session-id session) nil))
   (setf (mqtt-session-wsi session) nil
         (mqtt-session-established-p session) nil)
+  (when-let ((address (shiftf (mqtt-session-network-wsi-address session) nil)))
+    (remhash address *mqtt-network-wsis*))
   (when-let ((op (shiftf (mqtt-session-in-flight session) nil)))
     (%mqtt-fail-op op))
   (dolist (op (shiftf (mqtt-session-op-queue session) '()))
@@ -323,6 +335,10 @@ called with T once the message is sent (QoS 0) or acked (QoS 1)."
      ;; writable requests must target the wsi the callbacks come on
      (setf (mqtt-session-wsi session) wsi
            (mqtt-session-established-p session) t)
+     (let ((network-wsi-address
+             (cffi:pointer-address (%lws-get-network-wsi wsi))))
+       (setf (mqtt-session-network-wsi-address session) network-wsi-address
+             (gethash network-wsi-address *mqtt-network-wsis*) session))
      (when (mqtt-session-on-established session)
        (funcall (mqtt-session-on-established session) session))
      (when (mqtt-session-op-queue session)
@@ -367,3 +383,25 @@ called with T once the message is sent (QoS 0) or acked (QoS 1)."
    0))
 
 (register-lws-protocol "mqtt" #'(lambda () (cffi:callback mqtt-callback)))
+
+(defun %mqtt-wsi-destroy (wsi)
+  ;; Backstop for teardown paths that skip the session's close
+  ;; callbacks: the network wsi being destroyed while the session
+  ;; still holds a wsi means the close never cascaded to the mux
+  ;; child, and the child wsi being destroyed with a live session
+  ;; means MQTT_CLIENT_CLOSED never fired.  Either way, drop all wsi
+  ;; references and report the session closed / failed.
+  (let ((session (or (gethash (cffi:pointer-address wsi) *mqtt-network-wsis*)
+                     (let ((object (wsi-object wsi nil)))
+                       (and (mqtt-session-p object) object)))))
+    (when (and session (mqtt-session-wsi session))
+      (let ((established-p (mqtt-session-established-p session))
+            (on-connect-error (mqtt-session-on-connect-error session))
+            (on-closed (mqtt-session-on-closed session)))
+        (%mqtt-cleanup-session session)
+        (cond ((and established-p on-closed)
+               (funcall on-closed session))
+              ((and (not established-p) on-connect-error)
+               (funcall on-connect-error session "connection destroyed")))))))
+
+(register-wsi-destroy-handler 'mqtt #'%mqtt-wsi-destroy)

@@ -199,7 +199,12 @@ a timer object for CANCEL-TIMER.  Event loop thread only."
       (with-lws-object (info
                         (:struct lws-context-creation-info)
                         port +context-port-no-listen+
-                        options +lws-server-option-explicit-vhosts+
+                        ;; CPD_BYPASS: skip the Secure Streams captive
+                        ;; portal detection (periodic HTTP probes to
+                        ;; connectivitycheck.android.com) — pointless
+                        ;; wsi churn on isolated networks
+                        options (logior +lws-server-option-explicit-vhosts+
+                                        +lws-server-option-cpd-bypass+)
                         user (cffi:make-pointer id))
         (let ((ctx (%lws-create-context info)))
           (when (cffi:null-pointer-p ctx)

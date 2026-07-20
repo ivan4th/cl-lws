@@ -321,6 +321,11 @@ No-op if the connection is already gone.  Event loop thread only."
      (setf (http-request-open-p request) nil
            (http-request-wsi request) nil)
      (%request-done request))
+   0)
+  (:lws-callback-wsi-destroy
+   ;; delivered here (default protocol) for every wsi lws destroys;
+   ;; see *wsi-destroy-handlers* in registry.lisp
+   (handle-wsi-destroy wsi)
    0))
 
 (register-lws-protocol "cs-http" #'(lambda () (cffi:callback http-callback))
