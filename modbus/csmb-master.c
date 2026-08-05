@@ -238,10 +238,33 @@ static void reconnect_cb(struct lws_sorted_usec_list *sul)
 
 /* ---- connection FSM ---- */
 
+/* A master whose every unit is disabled must not hold or retry its
+ * transport: a dead endpoint behind a TCP-accepting forwarder (e.g.
+ * rinetd) accepts and immediately closes, so each "successful" connect
+ * resets the backoff and the master flaps CONNECTING/ONLINE/OFFLINE
+ * forever.  Such a master parks offline;
+ * csmb_master_set_unit_enabled() restarts it.  A master with no units
+ * at all is left alone (units may be added after open). */
+static int all_units_disabled(const csmb_master *m)
+{
+    const csmb_sunit *u = m->sched.units;
+
+    if (!u)
+        return 0;
+    for (; u; u = u->next)
+        if (u->enabled)
+            return 0;
+    return 1;
+}
+
 static void start_connect(csmb_master *m)
 {
     if (m->engine.destroyed)
         return;
+    if (all_units_disabled(m)) {
+        m->conn_state = CSMB_CONN_OFFLINE;
+        return;   /* park (no reschedule) */
+    }
     m->conn_state = CSMB_CONN_CONNECTING;
     if (!m->conn_announced) {   /* CONNECTING once per outage, not per retry */
         emit_conn_state(m, CSMB_CONN_CONNECTING, CSMB_CERR_NONE);
@@ -543,8 +566,22 @@ int csmb_master_set_unit_enabled(csmb_master *m, uint8_t unit, int enabled)
 {
     int rc = csmb_sched_set_unit_enabled(&m->engine, &m->sched, unit, enabled);
 
-    if (rc == CSMB_OK && enabled)
-        master_kick(m);
+    if (rc == CSMB_OK) {
+        if (enabled) {
+            /* possibly parked (see all_units_disabled): connect now */
+            if (m->conn_state == CSMB_CONN_OFFLINE && !m->conn)
+                lws_sul_schedule(m->engine.cx, 0, &m->reconnect_sul,
+                                 reconnect_cb, 0);
+            master_kick(m);
+        } else if (all_units_disabled(m)) {
+            /* drop the transport and park */
+            if (m->conn)
+                master_force_close(m, CSMB_CERR_NONE);
+            else
+                m->conn_state = CSMB_CONN_OFFLINE;
+            lws_sul_cancel(&m->reconnect_sul);
+        }
+    }
     csmb_event_flush(&m->engine);
     return rc;
 }
