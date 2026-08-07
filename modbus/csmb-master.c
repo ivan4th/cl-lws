@@ -28,6 +28,7 @@ struct csmb_master {
     int conn_state;                  /* csmb_conn_state_t */
     int conn_announced;              /* CONNECTING emitted this outage */
     int offline_announced;           /* OFFLINE emitted this outage */
+    int online_confirmed;            /* a valid response arrived on this conn */
 
     struct lws_sorted_usec_list reconnect_sul;   /* also the initial connect */
     struct lws_sorted_usec_list heartbeat_sul;
@@ -240,9 +241,8 @@ static void reconnect_cb(struct lws_sorted_usec_list *sul)
 
 /* A master whose every unit is disabled must not hold or retry its
  * transport: a dead endpoint behind a TCP-accepting forwarder (e.g.
- * rinetd) accepts and immediately closes, so each "successful" connect
- * resets the backoff and the master flaps CONNECTING/ONLINE/OFFLINE
- * forever.  Such a master parks offline;
+ * rinetd) accepts and immediately closes, so the master would keep
+ * dialing a peer nobody polls.  Such a master parks offline;
  * csmb_master_set_unit_enabled() restarts it.  A master with no units
  * at all is left alone (units may be added after open). */
 static int all_units_disabled(const csmb_master *m)
@@ -324,6 +324,7 @@ static void master_go_down(csmb_master *m, uint8_t cerr)
         csmb_sched_connection_down(&m->engine, &m->sched);
     }
     m->conn_state = CSMB_CONN_OFFLINE;
+    m->online_confirmed = 0;
     m->in_flight = 0;
     m->round_active = 0;
     m->pace_until = 0;
@@ -336,13 +337,28 @@ static void master_go_down(csmb_master *m, uint8_t cerr)
     schedule_reconnect(m);
 }
 
-static void master_go_online(csmb_master *m)
+/* First valid matched response on this connection: the peer is a live
+ * Modbus device, so announce ONLINE and end the outage. */
+static void master_confirm_online(csmb_master *m)
 {
-    m->conn_state = CSMB_CONN_ONLINE;
+    if (m->online_confirmed)
+        return;
+    m->online_confirmed = 1;
     emit_conn_state(m, CSMB_CONN_ONLINE, CSMB_CERR_NONE);
     m->conn_announced = 0;      /* the outage is over */
     m->offline_announced = 0;
     m->backoff_ms = 0;
+}
+
+/* The transport is up: run the scheduler and pump requests.  This does
+ * NOT announce ONLINE or reset the backoff: a dead endpoint behind a
+ * TCP-accepting forwarder (e.g. rinetd) accepts and then closes, so a
+ * bare TCP connect proves nothing, and announcing it would flap the
+ * driver -- and reset the backoff -- once per retry.  ONLINE is
+ * announced by master_confirm_online() on the first valid response. */
+static void master_transport_up(csmb_master *m)
+{
+    m->conn_state = CSMB_CONN_ONLINE;
     m->timeout_streak = 0;
     csmb_sched_connection_up(&m->sched);
     lws_sul_schedule(m->engine.cx, 0, &m->heartbeat_sul, heartbeat_cb,
@@ -351,6 +367,14 @@ static void master_go_online(csmb_master *m)
     m->round_active = 1;
     csmb_sched_start_round(&m->engine, &m->sched);
     master_pump(m);
+}
+
+/* serial/fd transports: no forwarder can sit in between, so a
+ * successfully opened descriptor confirms the link at once. */
+static void master_go_online(csmb_master *m)
+{
+    master_confirm_online(m);
+    master_transport_up(m);
 }
 
 /* Tear down the current connection ourselves (dead peer) and reconnect. */
@@ -370,7 +394,7 @@ static void master_force_close(csmb_master *m, uint8_t cerr)
 void csmb_master_on_connected(csmb_master *m, struct lws *wsi)
 {
     (void)wsi;
-    master_go_online(m);
+    master_transport_up(m);
 }
 
 void csmb_master_on_connect_error(csmb_master *m)
@@ -437,6 +461,7 @@ int csmb_master_on_rx(csmb_master *m, const uint8_t *buf, size_t len)
             csmb_response r;
 
             if (csmb_decode_response(r_pdu, r_plen, m->pending.fc, &r) >= 0) {
+                master_confirm_online(m);
                 lws_sul_cancel(&m->resp_sul);
                 m->in_flight = 0;
                 csmb_sched_on_response(&m->engine, &m->sched, &m->pending, &r,

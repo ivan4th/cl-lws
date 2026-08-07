@@ -530,6 +530,70 @@ total-len); else NIL."
                   #'(lambda (e) (and (eq (second e) :offline)
                                      (member (third e) '(:closed :timeout :connect-failed)))))))))
 
+;;; A dead endpoint behind a TCP-accepting forwarder (e.g. rinetd): the
+;;; transport connects fine but no request ever draws a response --
+;;; here, a hard-blacklisted slave unit drops the connection on the
+;;; master's first request.  The master must treat the whole episode as
+;;; ONE outage: a single CONNECTING and a single OFFLINE, and no ONLINE
+;;; until a first valid response actually arrives (meanwhile the
+;;; backoff keeps growing instead of being reset by each accepted
+;;; connect).  Lifting the blacklist ends the outage with exactly one
+;;; ONLINE and the initial span publish.
+
+(deftest test-modbus-master-forwarder-flap () ()
+  (let ((timed-out nil)
+        (rec nil))
+    (with-lws-context (context)
+      (setf rec (make-instance 'mb-master-recorder :context context))
+      (let ((slave (modbus-slave-open context '(:tcp-listen 0 :iface "127.0.0.1")
+                                      rec)))
+        (setf (rec-slave rec) slave)
+        (unwind-protect
+             (progn
+               (schedule context *test-timeout-seconds*
+                         #'(lambda () (setf timed-out t) (stop-context context)))
+               (modbus-register-range slave 1 :holding 10 5)
+               (modbus-set-values slave 1 :holding 10 '(1000 1001 1002 1003 1004))
+               ;; the "dead backend": accept, then drop on the first request
+               (modbus-blacklist slave 1 :hard)
+               (let ((port (modbus-slave-listen-port slave)))
+                 (is (plusp port))
+                 (let ((master (modbus-master-open context
+                                                   (list :tcp "127.0.0.1" port)
+                                                   rec
+                                                   :heartbeat 0.03
+                                                   :response-timeout 0.2)))
+                   (setf (rec-master rec) master)
+                   (modbus-add-unit master 1)
+                   (setf (rec-h1 rec) (modbus-subscribe master 1 :holding 10 5))
+                   ;; let it flap through a few reconnect cycles, then
+                   ;; "reconnect the backend"
+                   (schedule context 1.2
+                             #'(lambda () (modbus-blacklist slave 1 :none)))
+                   ;; done once the recovered master publishes the span
+                   (schedule context 0.02
+                             #'(lambda ()
+                                 (when (and (rec-online rec)
+                                            (>= (uc rec (rec-h1 rec)) 1))
+                                   (stop-context context)))
+                             :repeat t)
+                   (run-context context))))
+          (when (rec-master rec) (modbus-master-close (rec-master rec)))
+          (modbus-slave-close slave))))
+    (is (null timed-out))
+    ;; one outage, one recovery: CONNECTING and OFFLINE exactly once,
+    ;; ONLINE exactly once (after the blacklist was lifted) -- no flapping
+    (is (= 1 (count-if #'(lambda (e) (and (eq (first e) :conn-state)
+                                          (eq (second e) :connecting)))
+                       (rec-events rec))))
+    (is (= 1 (rec-offline-count rec)))
+    (is (= 1 (rec-online-count rec)))
+    ;; the recovered connection published the initial value
+    (is (equalp #(1000 1001 1002 1003 1004)
+                (first-update-values (reverse (rec-events rec)) (rec-h1 rec))))
+    ;; ONLINE was the last connection-state transition
+    (is (eq :online (second (find :conn-state (rec-events rec) :key #'first))))))
+
 ;;; Modbus/RTU loopback over a pty pair: a C slave on the pty master fd
 ;;; (:fd), a C master on the pty slave device (:serial).  Covers initial
 ;;; publish, a two-request write op (slave sees both writes in order, the
