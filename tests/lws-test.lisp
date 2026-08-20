@@ -149,3 +149,51 @@ STOP-CONTEXT; error out if the test timeout is hit first."
     (dotimes (i (length payload))
       (setf (aref payload i) (mod (* i 31) 256)))
     (run-echo-test payload)))
+
+;;; raw tcp: a peer name that does not resolve
+
+(defun stop-context-after-waves (context waves)
+  "Stop CONTEXT after WAVES more turns of the event loop -- enough for a
+stray extra callback to show up before the assertions run."
+  (schedule context nil
+            #'(lambda ()
+                (if (plusp waves)
+                    (stop-context-after-waves context (1- waves))
+                    (stop-context context)))))
+
+(defclass dead-name-client ()
+  ((context :initarg :context :reader dead-name-client-context)
+   (errors :initform '() :accessor dead-name-client-errors)
+   (connected-p :initform nil :accessor dead-name-client-connected-p)))
+
+(defmethod on-raw-connected ((handler dead-name-client) conn)
+  (declare (ignore conn))
+  (setf (dead-name-client-connected-p handler) t))
+
+(defmethod on-raw-connect-error ((handler dead-name-client) conn message)
+  (declare (ignore conn))
+  (push message (dead-name-client-errors handler))
+  ;; not done yet: let the loop turn a few more times, so that a second
+  ;; report -- the bug this guards against -- is counted too
+  (stop-context-after-waves (dead-name-client-context handler) 3))
+
+(defmethod on-raw-rx ((handler dead-name-client) conn octets)
+  (declare (ignore conn octets)))
+
+(deftest test-lws-raw-unresolvable-host () ()
+  ;; A libwebsockets built without LWS_WITH_SYS_ASYNC_DNS (the way the
+  ;; accelerator images build it) resolves peer names synchronously, so
+  ;; a name that does not resolve fails from inside RAW-CONNECT,
+  ;; delivering CLIENT_CONNECTION_ERROR re-entrantly.  Either way the
+  ;; handler must see exactly one connect error, and never before
+  ;; RAW-CONNECT has handed back the connection.
+  (let ((handler nil)
+        (conn nil))
+    (call-with-test-context
+     #'(lambda (context)
+         (setf handler (make-instance 'dead-name-client :context context)
+               conn (raw-connect context "no-such-host.invalid" 502 handler))
+         (is (null (dead-name-client-errors handler)))))
+    (is (not (dead-name-client-connected-p handler)))
+    (is (= 1 (length (dead-name-client-errors handler))))
+    (is (eq :connect-failed (raw-connection-state conn)))))

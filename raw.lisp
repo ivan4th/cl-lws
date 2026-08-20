@@ -75,9 +75,14 @@ state is :connecting; ON-RAW-CONNECTED / ON-RAW-CONNECT-ERROR follow."
                         opaque-user-data (cffi:make-pointer id))
         (let ((wsi (%lws-client-connect-via-info info)))
           (cond ((cffi:null-pointer-p wsi)
-                 ;; No wsi was created, so no callbacks will fire;
-                 ;; deliver the error asynchronously to keep the
-                 ;; caller's view consistent.
+                 ;; Either no wsi was created at all, or lws failed the
+                 ;; connection before returning -- it resolves peer
+                 ;; names synchronously, so a name that does not
+                 ;; resolve fails right here.  The re-entrant
+                 ;; CLIENT_CONNECTION_ERROR leaves that case to us (see
+                 ;; RAW-CALLBACK), so in both cases the error is ours
+                 ;; to deliver, asynchronously, once the caller has the
+                 ;; connection object.
                  (setf (raw-connection-state conn) :connect-failed)
                  (unregister-lws-object id)
                  (schedule context nil
@@ -224,13 +229,19 @@ Returns -1 to close the connection, 0 otherwise."
    0)
   (:lws-callback-client-connection-error
    (when-let ((conn (wsi-object wsi nil)))
-     (setf (raw-connection-state conn) :connect-failed
-           (raw-connection-wsi conn) nil)
-     (unregister-lws-object (raw-connection-id conn))
-     (on-raw-connect-error (raw-connection-handler conn) conn
-                           (if (cffi:null-pointer-p in)
-                               "connection error"
-                               (cffi:foreign-string-to-lisp in))))
+     ;; A null WSI slot means RAW-CONNECT is still on the stack: lws
+     ;; resolves peer names synchronously, so a name that does not
+     ;; resolve fails before %LWS-CLIENT-CONNECT-VIA-INFO returns, and
+     ;; that call is the only place the slot is set.  The caller does
+     ;; not have CONN yet, so RAW-CONNECT delivers that failure itself.
+     (when (raw-connection-wsi conn)
+       (setf (raw-connection-state conn) :connect-failed
+             (raw-connection-wsi conn) nil)
+       (unregister-lws-object (raw-connection-id conn))
+       (on-raw-connect-error (raw-connection-handler conn) conn
+                             (if (cffi:null-pointer-p in)
+                                 "connection error"
+                                 (cffi:foreign-string-to-lisp in)))))
    0)
   (:lws-callback-raw-rx
    (when-let ((conn (wsi-object wsi nil)))

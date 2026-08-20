@@ -153,6 +153,14 @@ are called on the event loop thread."
                           opaque-user-data (cffi:make-pointer id))
           (let ((wsi (%lws-client-connect-via-info info)))
             (cond ((cffi:null-pointer-p wsi)
+                   ;; Either no wsi was created at all, or lws failed
+                   ;; the connection before returning -- it resolves
+                   ;; broker names synchronously, so a name that does
+                   ;; not resolve fails right here.  The re-entrant
+                   ;; CLIENT_CONNECTION_ERROR leaves that case to us
+                   ;; (see MQTT-CALLBACK), so in both cases the error
+                   ;; is ours to deliver, asynchronously, once the
+                   ;; caller has the session object.
                    (%mqtt-cleanup-session session)
                    (schedule context nil
                              #'(lambda ()
@@ -346,13 +354,19 @@ called with T once the message is sent (QoS 0) or acked (QoS 1)."
    0)
   (:lws-callback-client-connection-error
    (when-let ((session (wsi-object wsi nil)))
-     (let ((message (if (cffi:null-pointer-p in)
-                        "connection error"
-                        (cffi:foreign-string-to-lisp in)))
-           (on-connect-error (mqtt-session-on-connect-error session)))
-       (%mqtt-cleanup-session session)
-       (when on-connect-error
-         (funcall on-connect-error session message))))
+     ;; A null WSI slot means MQTT-CONNECT is still on the stack: lws
+     ;; resolves broker names synchronously, so a name that does not
+     ;; resolve fails before %LWS-CLIENT-CONNECT-VIA-INFO returns, and
+     ;; that call is the only place the slot is set.  The caller does
+     ;; not have SESSION yet, so MQTT-CONNECT delivers that failure.
+     (when (mqtt-session-wsi session)
+       (let ((message (if (cffi:null-pointer-p in)
+                          "connection error"
+                          (cffi:foreign-string-to-lisp in)))
+             (on-connect-error (mqtt-session-on-connect-error session)))
+         (%mqtt-cleanup-session session)
+         (when on-connect-error
+           (funcall on-connect-error session message)))))
    0)
   (:lws-callback-mqtt-client-closed
    (when-let ((session (wsi-object wsi nil)))

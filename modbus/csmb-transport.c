@@ -167,9 +167,15 @@ csmb_conn *csmb_transport_connect(struct lws_context *cx,
     info.opaque_user_data = conn;
     info.pwsi = &wsi;
 
+    /* A failure lws can see without waiting for the network -- most
+     * importantly a peer name that does not resolve, since lws resolves
+     * synchronously -- is reported by a re-entrant
+     * CLIENT_CONNECTION_ERROR callback and a null return here.  That
+     * callback leaves the conn alone (conn->wsi is still null), so
+     * freeing it here is the only free on every failure path. */
     wsi = lws_client_connect_via_info(&info);
     if (!wsi) {
-        free(conn);
+        csmb_conn_free(conn);
         return NULL;
     }
     conn->wsi = wsi;

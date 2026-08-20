@@ -707,3 +707,47 @@ total-len); else NIL."
                                      (equalp (third e) #(111 222 333 444 555))))))
       ;; change-only: the unchanged block did not spam updates
       (is (<= (uc rec h2) 3)))))
+
+;;; Master pointed at a peer name that does not resolve.
+;;;
+;;; lws resolves synchronously, so the connect fails -- and reports
+;;; CLIENT_CONNECTION_ERROR -- before lws_client_connect_via_info()
+;;; returns, i.e. from inside csmb_transport_connect().  The conn must
+;;; be freed exactly once on that path (it used to be freed by the
+;;; callback and again by the caller, aborting the process), and the
+;;; master must degrade to the ordinary OFFLINE + backoff-retry path.
+
+(defclass mb-conn-recorder ()
+  ((states :initform '() :accessor rec-conn-states)))
+
+(defmethod on-modbus-connection-state ((h mb-conn-recorder) master state
+                                       &key error)
+  (declare (ignore master))
+  (push (list state error) (rec-conn-states h)))
+
+(deftest test-modbus-master-unresolvable-host () ()
+  (let ((rec (make-instance 'mb-conn-recorder))
+        (timed-out nil)
+        (master nil))
+    (with-lws-context (context)
+      (unwind-protect
+           (progn
+             (schedule context *test-timeout-seconds*
+                       #'(lambda () (setf timed-out t) (stop-context context)))
+             (setf master (modbus-master-open context
+                                              '(:tcp "no-such-host.invalid" 502)
+                                              rec
+                                              :heartbeat 0.05
+                                              :response-timeout 0.2))
+             (modbus-add-unit master 1)
+             (modbus-subscribe master 1 :holding 0 4)
+             ;; backoff is 500ms, doubling: this window covers the
+             ;; initial attempt plus two retries
+             (schedule context 1.6 #'(lambda () (stop-context context)))
+             (run-context context))
+        (when master (modbus-master-close master))))
+    (is (null timed-out))
+    ;; CONNECTING and OFFLINE are announced once per outage, however
+    ;; many attempts the window covered
+    (is (equal '((:connecting :none) (:offline :connect-failed))
+               (reverse (rec-conn-states rec))))))

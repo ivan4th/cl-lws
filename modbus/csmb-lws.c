@@ -126,12 +126,21 @@ int csmb_lws_protocol_callback(struct lws *wsi,
         conn = lws_get_opaque_user_data(wsi);
         if (!conn)
             return 0;
+        lws_set_opaque_user_data(wsi, NULL);
+        if (!conn->wsi)
+            /* Still inside csmb_transport_connect(): lws resolves peer
+             * names synchronously, so a name that does not resolve
+             * fails -- and is reported here -- before
+             * lws_client_connect_via_info() returns, which is where
+             * conn->wsi is set.  The conn is not ours to free or
+             * report on yet: csmb_transport_connect() sees the null
+             * wsi it gets back and does both. */
+            return 0;
         if (conn->owner && conn->role == CSMB_CONN_MASTER_TCP) {
             csmb_master_on_connect_error((csmb_master *)conn->owner);
             csmb_event_flush((csmb_engine *)conn->owner);
         }
         csmb_conn_free(conn);
-        lws_set_opaque_user_data(wsi, NULL);
         return 0;
 
     case LWS_CALLBACK_RAW_CLOSE:
