@@ -8,5 +8,6 @@
   :pathname "tests"
   :components ((:file "package")
                (:file "lws-test")
-               (:file "modbus-test"))
+               (:file "modbus-test")
+               (:file "vnc-test"))
   :depends-on (:lws :vtf :bordeaux-threads))

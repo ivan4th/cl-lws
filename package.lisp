@@ -66,7 +66,16 @@
    #:vnc-server #:vnc-server-open #:vnc-server-close
    #:vnc-server-listen-port #:vnc-server-client-count
    #:vnc-server-ptr #:vnc-server-iface #:vnc-blit-function #:vnc-server-blit
-   #:vnc-keysym-to-sdl
+   #:vnc-keysym-to-sdl #:vnc-server-client-info #:vnc-server-drop-clients
+   ;; the minimal RFB client (tests, diagnostics)
+   #:rfb-client #:rfb-connect #:rfb-close #:rfb-request-update
+   #:rfb-set-encodings #:rfb-set-pixel-format #:rfb-send-key
+   #:rfb-send-pointer #:rfb-send-octets
+   #:rfb-client-state #:rfb-client-version #:rfb-client-width #:rfb-client-height
+   #:rfb-client-name #:rfb-client-frame #:rfb-client-pixel
+   #:rfb-client-last-rects #:rfb-client-update-count
+   #:rfb-client-bytes-per-pixel #:rfb-client-fail-reason
+   #:rfb-client-on-established #:rfb-client-on-update #:rfb-client-on-closed
    ;; modbus slave
    #:modbus-slave-open
    #:modbus-slave-close

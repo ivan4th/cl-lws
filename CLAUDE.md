@@ -193,6 +193,11 @@ lws-facing unit.  The public contract is `vnc/csvnc.h`.
 - `csvnc-encode.c` — Raw + Hextile into a caller buffer sized by
   `csvnc_encode_max_size`; after a raw tile the next tile restates its
   colours (noVNC ignores a blank tile right after a raw one).
+- `csvnc-zrle.c` — ZRLE: 64x64 tiles as the cheapest of solid / raw /
+  packed palette / plain RLE / palette RLE, deflated through the
+  client's one zlib stream (kept in `csvnc_encoder` for the
+  connection's lifetime, level 3); CPIXEL follows the spec's 3-byte
+  rule.  noVNC prefers it, so it is what production uses.
 - `csvnc-region.c` — bounded dirty-rectangle list (waste-free merges,
   forced merge when full, full frame past 3/4 coverage).
 - `csvnc-keys.c` — X keysym -> SDL keycode; keypad digits map to
@@ -209,8 +214,16 @@ lws-facing unit.  The public contract is `vnc/csvnc.h`.
   screen every time).  A process-wide registry refuses a second server
   on a port already served (lws would share the listen socket).
 - `vnc.lisp` — the binding: `vnc-server-open/close`, `-listen-port`,
-  `-client-count`, `vnc-blit-function` (csvnc_blit for the cl-lvgl
-  flush hook), `vnc-server-blit`, `vnc-keysym-to-sdl`.
+  `-client-count`, `-client-info` (a plist per client: pending region,
+  queued bytes, encoding, bpp), `-drop-clients`, `vnc-blit-function`
+  (csvnc_blit for the cl-lvgl flush hook), `vnc-server-blit`,
+  `vnc-keysym-to-sdl`.
+- `vnc-client.lisp` — a minimal RFB client over `raw-connect` for the
+  tests and diagnostics (3.3/3.7/3.8, Raw decoded into a frame, ZRLE
+  skipped by length, Hextile ends decoding): `rfb-connect`,
+  `rfb-request-update`, `rfb-set-encodings`, `rfb-set-pixel-format`,
+  `rfb-send-key`, `rfb-send-octets`, `rfb-close`.  Lisp tests:
+  `tests/vnc-test.lisp`.
 
 `make -C vnc check` runs the C tests (including `tests/test-server`,
 a real lws context driven with plain sockets); `make -C vnc fuzz` builds the

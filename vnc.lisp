@@ -47,6 +47,24 @@
 (cffi:defcfun ("csvnc_keysym_to_sdl" %csvnc-keysym-to-sdl) :int32
   (keysym :uint32))
 
+(cffi:defcstruct csvnc-client-state
+  (established :int)
+  (pending-rects :int)
+  (pending-area :long)
+  (in-update :int)
+  (update-requested :int)
+  (queued-bytes size-t)
+  (encoding :int32)
+  (bpp :int))
+
+(cffi:defcfun ("csvnc_client_info" %csvnc-client-info) :int
+  (server :pointer)
+  (index :int)
+  (out :pointer))
+
+(cffi:defcfun ("csvnc_drop_clients" %csvnc-drop-clients) :void
+  (server :pointer))
+
 ;;; the protocol: listener vhosts bind accepted connections to it by name
 
 (register-lws-protocol "cs-vnc"
@@ -110,6 +128,35 @@ cannot be bound."
 (defun vnc-server-client-count (server)
   "The number of clients past the handshake."
   (%csvnc-client-count (vnc-server-ptr server)))
+
+(defun vnc-server-client-info (server index)
+  "A plist describing the INDEX-th connected client (newest first):
+:ESTABLISHED-P, :PENDING-RECTS, :PENDING-AREA, :IN-UPDATE-P,
+:UPDATE-REQUESTED-P, :QUEUED-BYTES, :ENCODING (:RAW / :HEXTILE / :ZRLE
+or the number) and :BPP; NIL when there is no such client."
+  (cffi:with-foreign-object (state '(:struct csvnc-client-state))
+    (when (zerop (%csvnc-client-info (vnc-server-ptr server) index state))
+      (cffi:with-foreign-slots ((established pending-rects pending-area
+                                 in-update update-requested queued-bytes
+                                 encoding bpp)
+                                state (:struct csvnc-client-state))
+        (list :established-p (/= established 0)
+              :pending-rects pending-rects
+              :pending-area pending-area
+              :in-update-p (/= in-update 0)
+              :update-requested-p (/= update-requested 0)
+              :queued-bytes queued-bytes
+              :encoding (case encoding
+                          (0 :raw)
+                          (5 :hextile)
+                          (16 :zrle)
+                          (t encoding))
+              :bpp bpp)))))
+
+(defun vnc-server-drop-clients (server)
+  "Close every client connection; the listener stays."
+  (%csvnc-drop-clients (vnc-server-ptr server))
+  (values))
 
 (defun vnc-blit-function ()
   "The C entry point csvnc_blit, to install as a display flush hook

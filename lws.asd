@@ -74,6 +74,7 @@
                (:cffi-grovel-file "modbus-grovel")
                (:file "modbus")
                (:vnc-c-library "vnc-c-library")
-               (:file "vnc"))
+               (:file "vnc")
+               (:file "vnc-client"))
   :depends-on (:alexandria :i4-diet-utils :iterate :cffi :bordeaux-threads :babel)
   :defsystem-depends-on (:cffi-grovel))
