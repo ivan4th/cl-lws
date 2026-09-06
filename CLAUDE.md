@@ -177,3 +177,29 @@ marshal cross-thread work through `lws:defer`.
   write, or the op may have timed out).
 - **CONN_STATE dedup**: `CONNECTING` and `OFFLINE` are emitted at most once
   per outage (not per reconnect attempt); `ONLINE` on each recovery.
+
+## VNC server (csvnc)
+
+A small C RFB server library in `vnc/` (`libcsvnc`) for the LVGL
+console, built like csmb: pure units with unit tests and fuzzers, one
+lws-facing unit.  The public contract is `vnc/csvnc.h`.
+
+- `csvnc-rfb.c` — handshake (3.3/3.7/3.8, security None) + streaming
+  client message parser (constant memory per connection; any violation
+  = drop the client).
+- `csvnc-pixfmt.c` — client pixel formats (8/16/32 bpp true colour,
+  both byte orders) as translation tables from the XRGB8888 shadow;
+  the shadow framebuffer and `csvnc_blit`'s copy (565 expansion).
+- `csvnc-encode.c` — Raw + Hextile into a caller buffer sized by
+  `csvnc_encode_max_size`; after a raw tile the next tile restates its
+  colours (noVNC ignores a blank tile right after a raw one).
+- `csvnc-region.c` — bounded dirty-rectangle list (waste-free merges,
+  forced merge when full, full frame past 3/4 coverage).
+- `csvnc-keys.c` — X keysym -> SDL keycode; keypad digits map to
+  ASCII like the evdev path in cl-lvgl.
+- `csvnc-lws.c` — the lws server (listener, clients, write scheduling).
+
+`make -C vnc check` runs the C tests; `make -C vnc fuzz` builds the
+libFuzzer harnesses (skips without libFuzzer), `make -C vnc
+fuzz-standalone` builds ASan/UBSan `tests/fuzz-*-sa N` drivers for
+toolchains without it (Apple clang).
