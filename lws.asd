@@ -31,6 +31,32 @@
 (defmethod asdf:perform ((op asdf:load-op) (component modbus-c-library))
   (uiop:symbol-call :lws '#:load-libcsmodbus (modbus-c-library-path)))
 
+;; The csvnc VNC server (vnc/): the same arrangement.
+(defclass vnc-c-library (asdf:static-file) ())
+
+(defmethod asdf:input-files ((op asdf:compile-op) (component vnc-c-library))
+  (let ((dir (asdf:system-relative-pathname :lws "vnc/")))
+    (append (uiop:directory-files dir "*.c")
+            (uiop:directory-files dir "*.h")
+            (list (merge-pathnames "Makefile" dir)))))
+
+(defun vnc-c-library-path ()
+  (asdf:system-relative-pathname
+   :lws #+darwin "vnc/libcsvnc.dylib" #-darwin "vnc/libcsvnc.so"))
+
+(defmethod asdf:output-files ((op asdf:compile-op) (component vnc-c-library))
+  (values (list (vnc-c-library-path)) t))
+
+(defmethod asdf:perform ((op asdf:compile-op) (component vnc-c-library))
+  (uiop:run-program
+   (list "make" "-C"
+         (namestring (asdf:system-relative-pathname :lws "vnc/")))
+   :output *standard-output*
+   :error-output *error-output*))
+
+(defmethod asdf:perform ((op asdf:load-op) (component vnc-c-library))
+  (uiop:symbol-call :lws '#:load-libcsvnc (vnc-c-library-path)))
+
 (asdf:defsystem #:lws
   :description "libwebsockets bindings for Common Lisp."
   :serial t
@@ -46,6 +72,8 @@
                (:file "mqtt")
                (:modbus-c-library "modbus-c-library")
                (:cffi-grovel-file "modbus-grovel")
-               (:file "modbus"))
+               (:file "modbus")
+               (:vnc-c-library "vnc-c-library")
+               (:file "vnc"))
   :depends-on (:alexandria :i4-diet-utils :iterate :cffi :bordeaux-threads :babel)
   :defsystem-depends-on (:cffi-grovel))

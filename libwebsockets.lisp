@@ -21,3 +21,14 @@
            cffi:*foreign-library-directories*
            :test #'equal)
   (cffi:use-foreign-library libcsmodbus))
+
+;; The csvnc VNC server (vnc/, built by lws.asd's VNC-C-LIBRARY
+;; component); loaded the same way as libcsmodbus.
+(cffi:define-foreign-library libcsvnc
+  (t (:default "libcsvnc")))
+
+(defun load-libcsvnc (build-path)
+  (pushnew (uiop:pathname-directory-pathname build-path)
+           cffi:*foreign-library-directories*
+           :test #'equal)
+  (cffi:use-foreign-library libcsvnc))

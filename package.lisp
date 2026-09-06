@@ -62,6 +62,11 @@
    #:mqtt-publish
    #:mqtt-disconnect
    #:mqtt-session-established-p
+   ;; vnc server
+   #:vnc-server #:vnc-server-open #:vnc-server-close
+   #:vnc-server-listen-port #:vnc-server-client-count
+   #:vnc-server-ptr #:vnc-server-iface #:vnc-blit-function #:vnc-server-blit
+   #:vnc-keysym-to-sdl
    ;; modbus slave
    #:modbus-slave-open
    #:modbus-slave-close

@@ -197,9 +197,23 @@ lws-facing unit.  The public contract is `vnc/csvnc.h`.
   forced merge when full, full frame past 3/4 coverage).
 - `csvnc-keys.c` — X keysym -> SDL keycode; keypad digits map to
   ASCII like the evdev path in cl-lvgl.
-- `csvnc-lws.c` — the lws server (listener, clients, write scheduling).
+- `csvnc-lws.c` — the lws server: one listener vhost per server
+  (protocol `"cs-vnc"`, registered from `vnc.lisp`), per client a
+  parser, a dirty region and ONE fixed output buffer; an update
+  answers one FramebufferUpdateRequest from a snapshot of the dirty
+  region streamed in bands (partial lws_write handled), so a viewer
+  that never reads costs its buffer plus a bounded region.  LastRect is
+  parsed but never sent (vncsnapshot offers it and then hangs on it).
+  `csvnc_blit` diffs the incoming pixels against the shadow and marks
+  only real changes dirty (LVGL FULL-mode displays flush the whole
+  screen every time).  A process-wide registry refuses a second server
+  on a port already served (lws would share the listen socket).
+- `vnc.lisp` — the binding: `vnc-server-open/close`, `-listen-port`,
+  `-client-count`, `vnc-blit-function` (csvnc_blit for the cl-lvgl
+  flush hook), `vnc-server-blit`, `vnc-keysym-to-sdl`.
 
-`make -C vnc check` runs the C tests; `make -C vnc fuzz` builds the
+`make -C vnc check` runs the C tests (including `tests/test-server`,
+a real lws context driven with plain sockets); `make -C vnc fuzz` builds the
 libFuzzer harnesses (skips without libFuzzer), `make -C vnc
 fuzz-standalone` builds ASan/UBSan `tests/fuzz-*-sa N` drivers for
 toolchains without it (Apple clang).
