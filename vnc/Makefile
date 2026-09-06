@@ -19,6 +19,8 @@ LWS_OBJS = csvnc-lws.o
 OBJS = $(PURE_OBJS) $(LWS_OBJS)
 
 TESTS = tests/test-rfb tests/test-pixfmt tests/test-encode tests/test-region tests/test-keys
+# the server test links the whole library against libwebsockets
+LWS_TESTS = tests/test-server
 
 # coverage-guided fuzz harnesses (clang + libFuzzer only; not run by check)
 FUZZERS = tests/fuzz-handshake tests/fuzz-messages tests/fuzz-encode
@@ -40,8 +42,11 @@ $(OBJS): csvnc.h csvnc-private.h Makefile
 tests/test-%: tests/test-%.c tests/test-util.h $(PURE_OBJS) csvnc.h csvnc-private.h
 	$(CC) $(CFLAGS) -o $@ $< $(PURE_OBJS)
 
-check: $(TESTS)
-	@set -e; for t in $(TESTS); do echo "== $$t"; ./$$t; done; echo "csvnc: all C tests passed"
+tests/test-server: tests/test-server.c tests/test-util.h $(OBJS) csvnc.h csvnc-private.h
+	$(CC) $(CFLAGS) -o $@ $< $(OBJS) $(LDFLAGS)
+
+check: $(TESTS) $(LWS_TESTS)
+	@set -e; for t in $(TESTS) $(LWS_TESTS); do echo "== $$t"; ./$$t; done; echo "csvnc: all C tests passed"
 
 # Build the fuzz harnesses; skips gracefully if the clang has no libFuzzer.
 # Run e.g. ./tests/fuzz-messages -max_len=512 -runs=2000000
@@ -61,7 +66,7 @@ fuzz-standalone:
 	done; echo "csvnc: standalone fuzzers built"
 
 clean:
-	rm -f $(OBJS) $(LIB) $(TESTS) $(FUZZERS) $(FUZZERS:=-sa)
+	rm -f $(OBJS) $(LIB) $(TESTS) $(LWS_TESTS) $(FUZZERS) $(FUZZERS:=-sa)
 	rm -rf tests/*.dSYM
 
 .PHONY: all check clean fuzz fuzz-standalone

@@ -39,3 +39,4 @@ vnc/tests/fuzz-messages
 vnc/tests/fuzz-encode
 vnc/tests/*-sa
 vnc/tests/*.dSYM/
+vnc/tests/test-server

@@ -180,8 +180,11 @@ int csvnc_fb_init(csvnc_fb *fb, int width, int height)
         || height > CSVNC_MAX_DIM)
         return -1;
     fb->px = calloc((size_t)width * (size_t)height, sizeof(uint32_t));
-    if (!fb->px)
+    fb->row = calloc((size_t)width, sizeof(uint32_t));
+    if (!fb->px || !fb->row) {
+        csvnc_fb_free(fb);
         return -1;
+    }
     fb->width = width;
     fb->height = height;
     return 0;
@@ -190,7 +193,8 @@ int csvnc_fb_init(csvnc_fb *fb, int width, int height)
 void csvnc_fb_free(csvnc_fb *fb)
 {
     free(fb->px);
-    fb->px = NULL;
+    free(fb->row);
+    fb->px = fb->row = NULL;
     fb->width = fb->height = 0;
 }
 
@@ -204,19 +208,41 @@ static inline uint32_t rgb565_to_xrgb(unsigned v)
     return (r << 16) | (g << 8) | b;
 }
 
-void csvnc_fb_blit(csvnc_fb *fb, int *x, int *y, int *w, int *h,
-                   const void *px, int stride_bytes, int src_format)
+/* Convert one source row into ROW (canonical 0x00RRGGBB). */
+static void convert_row(uint32_t *row, const uint8_t *src, int n, int fmt)
 {
-    int x0 = *x, y0 = *y, x1, y1, row, col;
-    const uint8_t *src = px;
+    int i;
 
-    if (*w <= 0 || *h <= 0 || x0 >= fb->width || y0 >= fb->height
-        || (long)x0 + *w <= 0 || (long)y0 + *h <= 0) {
-        *w = *h = 0;
-        return;
+    if (fmt == CSVNC_SRC_RGB565) {
+        for (i = 0; i < n; i++) {
+            uint16_t v;
+
+            memcpy(&v, src + (size_t)i * 2, 2);
+            row[i] = rgb565_to_xrgb(v);
+        }
+    } else {
+        for (i = 0; i < n; i++) {
+            uint32_t v;
+
+            memcpy(&v, src + (size_t)i * 4, 4);
+            row[i] = v & 0x00ffffffu;
+        }
     }
-    x1 = ((long)x0 + *w > fb->width) ? fb->width : x0 + *w;
-    y1 = ((long)y0 + *h > fb->height) ? fb->height : y0 + *h;
+}
+
+int csvnc_fb_blit(csvnc_fb *fb, int x, int y, int w, int h,
+                  const void *px, int stride_bytes, int src_format,
+                  struct csvnc_region *dirty)
+{
+    int x0 = x, y0 = y, x1, y1, row, changed_rows = 0;
+    const uint8_t *src = px;
+    int band = -1, bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
+
+    if (w <= 0 || h <= 0 || x0 >= fb->width || y0 >= fb->height
+        || (long)x0 + w <= 0 || (long)y0 + h <= 0)
+        return 0;
+    x1 = ((long)x0 + w > fb->width) ? fb->width : x0 + w;
+    y1 = ((long)y0 + h > fb->height) ? fb->height : y0 + h;
     if (x0 < 0) {
         src += (size_t)(-x0) * (src_format == CSVNC_SRC_RGB565 ? 2 : 4);
         x0 = 0;
@@ -225,27 +251,39 @@ void csvnc_fb_blit(csvnc_fb *fb, int *x, int *y, int *w, int *h,
         src += (size_t)(-y0) * (size_t)stride_bytes;
         y0 = 0;
     }
-    *x = x0;
-    *y = y0;
-    *w = x1 - x0;
-    *h = y1 - y0;
+    w = x1 - x0;
 
-    for (row = y0; row < y1; row++) {
+    for (row = y0; row < y1; row++, src += stride_bytes) {
         uint32_t *dst = fb->px + (size_t)row * fb->width + x0;
+        int first, last;
 
-        if (src_format == CSVNC_SRC_RGB565) {
-            const uint8_t *s = src;
-
-            for (col = 0; col < *w; col++) {
-                uint16_t v;
-
-                memcpy(&v, s, 2);
-                dst[col] = rgb565_to_xrgb(v);
-                s += 2;
-            }
+        convert_row(fb->row, src, w, src_format);
+        if (memcmp(dst, fb->row, (size_t)w * 4) == 0)
+            continue;
+        for (first = 0; dst[first] == fb->row[first]; first++)
+            ;
+        for (last = w - 1; dst[last] == fb->row[last]; last--)
+            ;
+        memcpy(dst + first, fb->row + first, (size_t)(last - first + 1) * 4);
+        changed_rows++;
+        if (!dirty)
+            continue;
+        if (row / CSVNC_HEXTILE_TILE != band) {
+            if (band >= 0)
+                csvnc_region_add(dirty, bx0, by0, bx1 - bx0 + 1, by1 - by0 + 1);
+            band = row / CSVNC_HEXTILE_TILE;
+            bx0 = x0 + first;
+            bx1 = x0 + last;
+            by0 = by1 = row;
         } else {
-            memcpy(dst, src, (size_t)*w * 4);
+            if (x0 + first < bx0)
+                bx0 = x0 + first;
+            if (x0 + last > bx1)
+                bx1 = x0 + last;
+            by1 = row;
         }
-        src += stride_bytes;
     }
+    if (dirty && band >= 0)
+        csvnc_region_add(dirty, bx0, by0, bx1 - bx0 + 1, by1 - by0 + 1);
+    return changed_rows;
 }

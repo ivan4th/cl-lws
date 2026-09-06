@@ -247,82 +247,107 @@ static void test_rejected(void)
 static void test_fb_blit(void)
 {
     csvnc_fb fb;
+    csvnc_region dirty;
     uint32_t src[3 * 4];
     uint16_t src565[2 * 2];
-    int x, y, w, h, i;
+    int i;
 
     TCHECK_EQ(csvnc_fb_init(&fb, 8, 6), 0);
     TCHECK_EQ(fb.width, 8);
     TCHECK_EQ(fb.height, 6);
     for (i = 0; i < 48; i++)
         TCHECK_EQ(fb.px[i], 0);
+    csvnc_region_init(&dirty, 8, 6);
     for (i = 0; i < 12; i++)
         src[i] = 0x00100000u * (uint32_t)(i + 1);
     /* 3 wide x 4 tall block from a 3-pixel-stride source at (2,1) */
-    x = 2;
-    y = 1;
-    w = 3;
-    h = 4;
-    csvnc_fb_blit(&fb, &x, &y, &w, &h, src, 12, CSVNC_SRC_XRGB8888);
-    TCHECK_EQ(x, 2);
-    TCHECK_EQ(y, 1);
-    TCHECK_EQ(w, 3);
-    TCHECK_EQ(h, 4);
+    TCHECK_EQ(csvnc_fb_blit(&fb, 2, 1, 3, 4, src, 12, CSVNC_SRC_XRGB8888, &dirty), 4);
     TCHECK_EQ(fb.px[1 * 8 + 2], 0x00100000);
     TCHECK_EQ(fb.px[1 * 8 + 4], 0x00300000);
     TCHECK_EQ(fb.px[4 * 8 + 4], 0x00c00000);
     TCHECK_EQ(fb.px[1 * 8 + 1], 0);
     TCHECK_EQ(fb.px[1 * 8 + 5], 0);
     TCHECK_EQ(fb.px[5 * 8 + 2], 0);
+    /* the whole block changed: exactly it is dirty */
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].x, 2);
+    TCHECK_EQ(dirty.r[0].y, 1);
+    TCHECK_EQ(dirty.r[0].w, 3);
+    TCHECK_EQ(dirty.r[0].h, 4);
+    /* the same block again: nothing changes, nothing is dirty; a
+     * different X byte does not count as a change */
+    csvnc_region_clear(&dirty);
+    for (i = 0; i < 12; i++)
+        src[i] |= 0xff000000u;
+    TCHECK_EQ(csvnc_fb_blit(&fb, 2, 1, 3, 4, src, 12, CSVNC_SRC_XRGB8888, &dirty), 0);
+    TCHECK(csvnc_region_empty(&dirty));
+    TCHECK_EQ(fb.px[1 * 8 + 2], 0x00100000);
+    /* one pixel changes: a 1x1 dirty rectangle */
+    src[7] = 0x00000001;   /* row 2, col 1 of the block = (3,3) */
+    TCHECK_EQ(csvnc_fb_blit(&fb, 2, 1, 3, 4, src, 12, CSVNC_SRC_XRGB8888, &dirty), 1);
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].x, 3);
+    TCHECK_EQ(dirty.r[0].y, 3);
+    TCHECK_EQ(dirty.r[0].w, 1);
+    TCHECK_EQ(dirty.r[0].h, 1);
+    TCHECK_EQ(fb.px[3 * 8 + 3], 1);
+    /* two changed pixels on different rows: their bounding box */
+    csvnc_region_clear(&dirty);
+    src[0] = 0x00000002;   /* (2,1) */
+    src[11] = 0x00000003;  /* (4,4) */
+    TCHECK_EQ(csvnc_fb_blit(&fb, 2, 1, 3, 4, src, 12, CSVNC_SRC_XRGB8888, &dirty), 2);
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].x, 2);
+    TCHECK_EQ(dirty.r[0].y, 1);
+    TCHECK_EQ(dirty.r[0].w, 3);
+    TCHECK_EQ(dirty.r[0].h, 4);
     /* clipping on the right/bottom: source rows stay aligned */
-    x = 6;
-    y = 4;
-    w = 3;
-    h = 4;
-    csvnc_fb_blit(&fb, &x, &y, &w, &h, src, 12, CSVNC_SRC_XRGB8888);
-    TCHECK_EQ(w, 2);
-    TCHECK_EQ(h, 2);
+    csvnc_region_clear(&dirty);
+    for (i = 0; i < 12; i++)
+        src[i] = 0x00100000u * (uint32_t)(i + 1);
+    TCHECK_EQ(csvnc_fb_blit(&fb, 6, 4, 3, 4, src, 12, CSVNC_SRC_XRGB8888, &dirty), 2);
     TCHECK_EQ(fb.px[4 * 8 + 6], 0x00100000);
     TCHECK_EQ(fb.px[4 * 8 + 7], 0x00200000);
     TCHECK_EQ(fb.px[5 * 8 + 6], 0x00400000);
     TCHECK_EQ(fb.px[5 * 8 + 7], 0x00500000);
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].x, 6);
+    TCHECK_EQ(dirty.r[0].y, 4);
+    TCHECK_EQ(dirty.r[0].w, 2);
+    TCHECK_EQ(dirty.r[0].h, 2);
     /* clipping at the top/left skips source pixels */
-    x = -1;
-    y = -2;
-    w = 3;
-    h = 4;
-    csvnc_fb_blit(&fb, &x, &y, &w, &h, src, 12, CSVNC_SRC_XRGB8888);
-    TCHECK_EQ(x, 0);
-    TCHECK_EQ(y, 0);
-    TCHECK_EQ(w, 2);
-    TCHECK_EQ(h, 2);
+    csvnc_region_clear(&dirty);
+    TCHECK_EQ(csvnc_fb_blit(&fb, -1, -2, 3, 4, src, 12, CSVNC_SRC_XRGB8888, &dirty), 2);
     TCHECK_EQ(fb.px[0], 0x00800000);   /* src row 2, col 1 */
     TCHECK_EQ(fb.px[1], 0x00900000);
     TCHECK_EQ(fb.px[8], 0x00b00000);
     TCHECK_EQ(fb.px[9], 0x00c00000);
-    /* entirely outside */
-    x = 8;
-    y = 0;
-    w = 2;
-    h = 2;
-    csvnc_fb_blit(&fb, &x, &y, &w, &h, src, 12, CSVNC_SRC_XRGB8888);
-    TCHECK_EQ(w, 0);
-    TCHECK_EQ(h, 0);
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].x, 0);
+    TCHECK_EQ(dirty.r[0].y, 0);
+    TCHECK_EQ(dirty.r[0].w, 2);
+    TCHECK_EQ(dirty.r[0].h, 2);
+    /* entirely outside, or no dirty region wanted */
+    csvnc_region_clear(&dirty);
+    TCHECK_EQ(csvnc_fb_blit(&fb, 8, 0, 2, 2, src, 12, CSVNC_SRC_XRGB8888, &dirty), 0);
+    TCHECK_EQ(csvnc_fb_blit(&fb, 0, 6, 2, 2, src, 12, CSVNC_SRC_XRGB8888, &dirty), 0);
+    TCHECK(csvnc_region_empty(&dirty));
+    TCHECK_EQ(csvnc_fb_blit(&fb, 0, 0, 2, 2, src, 8, CSVNC_SRC_XRGB8888, NULL), 2);
+    TCHECK_EQ(fb.px[0], 0x00100000);
     /* RGB565 expansion with bit replication: 0xf800 -> ff0000,
      * 0x07e0 -> 00ff00, 0x001f -> 0000ff, 0x8410 -> 848284 */
     src565[0] = 0xf800;
     src565[1] = 0x07e0;
     src565[2] = 0x001f;
     src565[3] = 0x8410;
-    x = 0;
-    y = 0;
-    w = 2;
-    h = 2;
-    csvnc_fb_blit(&fb, &x, &y, &w, &h, src565, 4, CSVNC_SRC_RGB565);
+    TCHECK_EQ(csvnc_fb_blit(&fb, 0, 0, 2, 2, src565, 4, CSVNC_SRC_RGB565, &dirty), 2);
     TCHECK_EQ(fb.px[0], 0x00ff0000);
     TCHECK_EQ(fb.px[1], 0x0000ff00);
     TCHECK_EQ(fb.px[8], 0x000000ff);
     TCHECK_EQ(fb.px[9], 0x00848284);
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].w, 2);
+    TCHECK_EQ(dirty.r[0].h, 2);
     csvnc_fb_free(&fb);
     TCHECK(fb.px == NULL);
     /* bad geometry */
@@ -331,5 +356,37 @@ static void test_fb_blit(void)
     TCHECK_EQ(csvnc_fb_init(&fb, 100000, 100000), -1);
 }
 
+static void test_fb_blit_bands(void)
+{
+    /* changes in different 16-row bands become separate rectangles
+     * (and adjacent, waste-free ones merge in the region) */
+    csvnc_fb fb;
+    csvnc_region dirty;
+    uint32_t *src;
+    int i;
+
+    TCHECK_EQ(csvnc_fb_init(&fb, 64, 48), 0);
+    csvnc_region_init(&dirty, 64, 48);
+    src = calloc(64 * 48, 4);
+    src[5 * 64 + 10] = 1;        /* band 0 */
+    src[40 * 64 + 50] = 1;       /* band 2 */
+    TCHECK_EQ(csvnc_fb_blit(&fb, 0, 0, 64, 48, src, 256, CSVNC_SRC_XRGB8888, &dirty), 2);
+    TCHECK_EQ(dirty.n, 2);
+    TCHECK_EQ(csvnc_region_area(&dirty), 2);
+    /* a full-height column of change: three band boxes that merge
+     * into one column */
+    csvnc_region_clear(&dirty);
+    for (i = 0; i < 48; i++)
+        src[i * 64 + 20] = 2;
+    TCHECK_EQ(csvnc_fb_blit(&fb, 0, 0, 64, 48, src, 256, CSVNC_SRC_XRGB8888, &dirty), 48);
+    TCHECK_EQ(dirty.n, 1);
+    TCHECK_EQ(dirty.r[0].x, 20);
+    TCHECK_EQ(dirty.r[0].w, 1);
+    TCHECK_EQ(dirty.r[0].h, 48);
+    free(src);
+    csvnc_fb_free(&fb);
+}
+
 TEST_MAIN(test_native, test_novnc_format, test_rgb565, test_bgr233,
-          test_big_endian_32, test_rejected, test_fb_blit)
+          test_big_endian_32, test_rejected, test_fb_blit,
+          test_fb_blit_bands)

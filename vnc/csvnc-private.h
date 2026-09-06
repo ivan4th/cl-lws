@@ -75,17 +75,23 @@ uint32_t csvnc_pix_get(const csvnc_pixfmt *f, const uint8_t *src);
 
 /* ---- shadow framebuffer ---- */
 
+struct csvnc_region;
+
 typedef struct csvnc_fb {
     uint32_t *px;        /* width * height, 0x00RRGGBB */
+    uint32_t *row;       /* width-pixel scratch row for the blit compare */
     int width, height;
 } csvnc_fb;
 
 int csvnc_fb_init(csvnc_fb *fb, int width, int height);  /* 0 / -1 */
 void csvnc_fb_free(csvnc_fb *fb);
-/* Blit as csvnc_blit(); returns the clipped rectangle in *X.. *H
- * (w or h 0 when nothing was copied). */
-void csvnc_fb_blit(csvnc_fb *fb, int *x, int *y, int *w, int *h,
-                   const void *px, int stride_bytes, int src_format);
+/* Blit as csvnc_blit(): the clipped block is converted, compared with
+ * the shadow row by row and copied where it differs; the bounding box
+ * of the changed pixels in every 16-row band is added to DIRTY (may be
+ * NULL).  Returns the number of rows that had changes. */
+int csvnc_fb_blit(csvnc_fb *fb, int x, int y, int w, int h,
+                  const void *px, int stride_bytes, int src_format,
+                  struct csvnc_region *dirty);
 
 /* ---- dirty regions (csvnc-region.c) ----
  *

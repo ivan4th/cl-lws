@@ -25,7 +25,9 @@
 extern "C" {
 #endif
 
+struct lws;
 struct lws_context;
+struct lws_protocols;
 
 /* Source pixel formats accepted by csvnc_blit().  The shadow itself is
  * always XRGB8888: one uint32_t per pixel holding 0x00RRGGBB in host
@@ -39,7 +41,7 @@ typedef struct csvnc_callbacks {
     /* A KeyEvent from a client, already translated to an SDL2 keycode
      * (SDLK_*: printable ASCII as the character, others as
      * 0x40000000 | scancode, see csvnc_keysym_to_sdl()).  Keysyms with
-     * no mapping are dropped before this is called.  Required. */
+     * no mapping are dropped before this is called.  Optional. */
     void (*key)(void *user, int32_t sdl_key, int32_t down);
     /* A PointerEvent; buttons is the RFB button mask (bit 0 = left).
      * Optional (NULL = ignore pointer input). */
@@ -50,22 +52,32 @@ typedef struct csvnc_server csvnc_server;
 
 /* Create a server listening on IFACE:PORT (iface NULL = all
  * interfaces, port 0 = ephemeral, see csvnc_listen_port()) exporting
- * a WIDTH x HEIGHT framebuffer, initially black.  CBS is copied.
- * Returns NULL on failure (bad geometry, listen error, out of
+ * a WIDTH x HEIGHT framebuffer, initially black.  PROTOCOLS is the
+ * context's protocol array, which must contain "cs-vnc" bound to
+ * csvnc_lws_protocol_callback.  CBS is copied (NULL = no callbacks).
+ * Returns NULL on failure (bad geometry, port in use, out of
  * memory). */
-csvnc_server *csvnc_create(struct lws_context *cx, const char *iface,
-                           int port, int width, int height,
+csvnc_server *csvnc_create(struct lws_context *cx,
+                           const struct lws_protocols *protocols,
+                           const char *iface, int port,
+                           int width, int height,
                            const csvnc_callbacks *cbs, void *user);
+
+/* The lws protocol callback to register under the name "cs-vnc". */
+int csvnc_lws_protocol_callback(struct lws *wsi, int reason,
+                                void *user, void *in, size_t len);
 
 /* The port actually bound (useful with port 0). */
 int csvnc_listen_port(const csvnc_server *s);
 
 /* Copy a W x H block of pixels at (X, Y) into the shadow framebuffer
- * and mark it dirty for every client.  PX points at the top-left
- * source pixel, rows are STRIDE_BYTES apart, SRC_FORMAT is one of
- * CSVNC_SRC_*.  The rectangle is clipped to the framebuffer.  Cheap
- * enough to call from a display flush callback: one memcpy (or a
- * 565->8888 expansion) of the area. */
+ * and mark what actually changed dirty for every client (the block is
+ * compared against the shadow, so a display that flushes the whole
+ * screen for every change still yields small updates).  PX points at
+ * the top-left source pixel, rows are STRIDE_BYTES apart, SRC_FORMAT
+ * is one of CSVNC_SRC_*.  The rectangle is clipped to the framebuffer.
+ * Cheap enough to call from a display flush callback: one compare +
+ * copy (or 565->8888 expansion) pass over the area. */
 void csvnc_blit(csvnc_server *s, int x, int y, int w, int h,
                 const void *px, int stride_bytes, int src_format);
 
