@@ -395,10 +395,21 @@ csvnc_server *csvnc_create(struct lws_context *cx,
     /* the buffer must hold the update header plus the biggest band in
      * the biggest client format with the costliest encoder */
     csvnc_encoder_init(&probe);
-    csvnc_encoder_select(&probe, CSVNC_ENC_HEXTILE);
     csvnc_pixfmt_native(&widest);
-    s->client_cap = CSVNC_UPDATE_HDR_SIZE
-        + csvnc_encode_max_size(&probe, &widest, width, s->band_rows);
+    s->client_cap = 0;
+    {
+        static const int32_t encs[] = { CSVNC_ENC_RAW, CSVNC_ENC_HEXTILE,
+                                        CSVNC_ENC_ZRLE };
+        size_t i, n;
+
+        for (i = 0; i < sizeof(encs) / sizeof(encs[0]); i++) {
+            csvnc_encoder_select(&probe, encs[i]);
+            n = csvnc_encode_max_size(&probe, &widest, width, s->band_rows);
+            if (n > s->client_cap)
+                s->client_cap = n;
+        }
+    }
+    s->client_cap += CSVNC_UPDATE_HDR_SIZE;
 
     snprintf(namebuf, sizeof(namebuf), "csvnc-%u", ++seq);
     s->vhost_name = strdup(namebuf);
@@ -469,6 +480,39 @@ int csvnc_client_count(const csvnc_server *s)
         if (csvnc_rfb_established(&c->rfb))
             n++;
     return n;
+}
+
+int csvnc_client_info(const csvnc_server *s, int index,
+                      csvnc_client_state *out)
+{
+    const csvnc_client *c;
+
+    if (!s || index < 0)
+        return -1;
+    for (c = s->clients; c && index > 0; c = c->next)
+        index--;
+    if (!c)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->established = csvnc_rfb_established(&c->rfb);
+    out->pending_rects = c->pending.n;
+    out->pending_area = csvnc_region_area(&c->pending);
+    out->in_update = c->in_update;
+    out->update_requested = c->update_requested;
+    out->queued_bytes = c->len - c->off;
+    out->encoding = c->rfb.enc;
+    out->bpp = c->rfb.fmt.bpp;
+    return 0;
+}
+
+void csvnc_drop_clients(csvnc_server *s)
+{
+    csvnc_client *c;
+
+    if (!s)
+        return;
+    for (c = s->clients; c; c = c->next)
+        lws_set_timeout(c->wsi, PENDING_TIMEOUT_HTTP_CONTENT, LWS_TO_KILL_ASYNC);
 }
 
 void csvnc_destroy(csvnc_server *s)

@@ -39,7 +39,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         fb.px[i] = (size && i < (int)(data[0] % (npx + 1))) ? 0x123456 : v;
     }
     csvnc_encoder_init(&e);
-    csvnc_encoder_select(&e, (size && data[0] & 1) ? CSVNC_ENC_HEXTILE : CSVNC_ENC_RAW);
+    csvnc_encoder_select(&e, !size ? CSVNC_ENC_RAW
+                         : (data[0] & 3) == 1 ? CSVNC_ENC_HEXTILE
+                         : (data[0] & 3) == 2 ? CSVNC_ENC_ZRLE : CSVNC_ENC_RAW);
     cap = csvnc_encode_max_size(&e, &f, rw, rh);
     buf = malloc(cap);
     if (!buf)
@@ -47,9 +49,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     n = csvnc_encode_rect(&e, &f, &fb, x, y, rw, rh, buf, cap);
     if (n == 0 || n > cap)
         abort();
-    /* a too-small buffer must be refused, never overrun */
-    if (n > 1 && csvnc_encode_rect(&e, &f, &fb, x, y, rw, rh, buf, n - 1) != 0)
-        abort();
+    /* a too-small buffer must be refused, never overrun.  Raw and
+     * Hextile are deterministic, so one byte less than N must fail; a
+     * fresh ZRLE stream may legitimately produce fewer bytes than the
+     * continuing one did, so it is only asked to fit in 3 bytes (less
+     * than its length prefix).  A refused ZRLE rect desynchronises
+     * its stream by design, hence the fresh encoder. */
+    {
+        csvnc_encoder e2;
+        size_t small = e.enc == CSVNC_ENC_ZRLE ? CSVNC_RECT_HDR_SIZE + 3 : n - 1;
+
+        csvnc_encoder_init(&e2);
+        csvnc_encoder_select(&e2, e.enc);
+        if (n > 1 && csvnc_encode_rect(&e2, &f, &fb, x, y, rw, rh, buf, small) != 0)
+            abort();
+        csvnc_encoder_free(&e2);
+    }
     free(buf);
     csvnc_encoder_free(&e);
     csvnc_fb_free(&fb);

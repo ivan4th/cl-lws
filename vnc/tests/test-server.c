@@ -18,6 +18,7 @@
 #include <errno.h>
 #include "../csvnc-private.h"
 #include "test-util.h"
+#include "zrle-ref.h"
 
 static struct lws_context *cx;
 static lws_sorted_usec_list_t tick_sul;
@@ -73,6 +74,9 @@ typedef struct client {
     uint8_t rx[1 << 20];
     size_t rxlen;
     int eof;
+    zrle_ref zrle;
+    int zrle_inited;
+    int32_t last_enc;      /* encoding of the last rectangle read */
 } client;
 
 static int client_connect(client *c, int port)
@@ -170,6 +174,9 @@ static void client_close(client *c)
     if (c->fd >= 0)
         close(c->fd);
     c->fd = -1;
+    if (c->zrle_inited)
+        zrle_ref_free(&c->zrle);
+    c->zrle_inited = 0;
 }
 
 /* RFB 3.8 / None / ClientInit; leaves the parser established and
@@ -273,8 +280,30 @@ static int client_read_update(client *c, uint32_t *img, int w, int h,
             rects[got].h = rh;
         }
         got++;
+        c->last_enc = enc;
         TCHECK(rx >= 0 && ry >= 0 && rw > 0 && rh > 0 && rx + rw <= w && ry + rh <= h);
-        if (enc == CSVNC_ENC_RAW) {
+        if (enc == CSVNC_ENC_ZRLE) {
+            uint32_t zlen, *tile = malloc((size_t)rw * rh * 4);
+            long used;
+
+            if (!client_wait(c, 4))
+                return -1;
+            zlen = csvnc_get_u32(c->rx);
+            if (!client_wait(c, 4 + zlen))
+                return -1;
+            if (!c->zrle_inited) {
+                zrle_ref_init(&c->zrle);
+                c->zrle_inited = 1;
+            }
+            used = zrle_ref_decode(&c->zrle, &native, c->rx, c->rxlen, rw, rh, tile);
+            TCHECK_EQ(used, 4 + (long)zlen);
+            if (used == 4 + (long)zlen)
+                for (y = 0; y < rh; y++)
+                    for (x = 0; x < rw; x++)
+                        img[(ry + y) * w + rx + x] = tile[y * rw + x];
+            free(tile);
+            client_consume(c, 4 + zlen);
+        } else if (enc == CSVNC_ENC_RAW) {
             if (!client_wait(c, (size_t)rw * rh * 4))
                 return -1;
             for (y = 0; y < rh; y++)
@@ -438,6 +467,68 @@ static void test_basic_updates(void)
         TCHECK_EQ(c.rxlen, 0);
     }
 
+    /* ZRLE preferred over Hextile (noVNC's order): rectangles arrive
+     * as ZRLE through the client's one stream, pixel-exact, across
+     * several updates */
+    {
+        int32_t encs[3] = { CSVNC_ENC_ZRLE, CSVNC_ENC_HEXTILE, CSVNC_ENC_RAW };
+        csvnc_client_state info;
+
+        client_set_encodings(&c, encs, 3);
+        fill(frame, W * H, 0x987654);
+        csvnc_blit(s, 0, 0, W, H, frame, W * 4, CSVNC_SRC_XRGB8888);
+        client_request(&c, 1, 0, 0, W, H);
+        n = client_read_update(&c, img, W, H, rects, 64);
+        TCHECK(n >= 1);
+        TCHECK_EQ(c.last_enc, CSVNC_ENC_ZRLE);
+        TCHECK(memcmp(img, frame, sizeof(img)) == 0);
+        for (i = 0; i < 3; i++) {
+            frame[(i + 1) * 1234 % (W * H)] = 0x00ff00;
+            csvnc_blit(s, 0, 0, W, H, frame, W * 4, CSVNC_SRC_XRGB8888);
+            client_request(&c, 1, 0, 0, W, H);
+            n = client_read_update(&c, img, W, H, rects, 64);
+            TCHECK_EQ(n, 1);
+            TCHECK_EQ(c.last_enc, CSVNC_ENC_ZRLE);
+            TCHECK(memcmp(img, frame, sizeof(img)) == 0);
+        }
+        /* client info reflects the negotiated state and the idle queue */
+        TCHECK_EQ(csvnc_client_info(s, 0, &info), 0);
+        TCHECK_EQ(info.established, 1);
+        TCHECK_EQ(info.encoding, CSVNC_ENC_ZRLE);
+        TCHECK_EQ(info.bpp, 32);
+        TCHECK_EQ(info.pending_rects, 0);
+        TCHECK_EQ(info.pending_area, 0);
+        TCHECK_EQ(info.in_update, 0);
+        TCHECK_EQ(info.update_requested, 0);
+        TCHECK_EQ(info.queued_bytes, 0);
+        TCHECK_EQ(csvnc_client_info(s, 1, &info), -1);
+        TCHECK_EQ(csvnc_client_info(s, -1, &info), -1);
+        /* a pending request without dirty pixels shows as requested */
+        client_request(&c, 1, 0, 0, W, H);
+        for (i = 0; i < 20; i++)
+            service();
+        TCHECK_EQ(csvnc_client_info(s, 0, &info), 0);
+        TCHECK_EQ(info.update_requested, 1);
+        TCHECK_EQ(info.pending_rects, 0);
+        /* back to Raw for the rest: a request is already pending, so
+         * wait until the server has READ the new encodings before
+         * dirtying anything (an update that starts earlier rightly
+         * uses the old one) */
+        encs[0] = CSVNC_ENC_RAW;
+        client_set_encodings(&c, encs, 1);
+        for (i = 0; i < 5000; i++) {
+            service();
+            if (csvnc_client_info(s, 0, &info) == 0 && info.encoding == CSVNC_ENC_RAW)
+                break;
+        }
+        TCHECK_EQ(info.encoding, CSVNC_ENC_RAW);
+        frame[5] = 0x0000ff;
+        csvnc_blit(s, 0, 0, W, H, frame, W * 4, CSVNC_SRC_XRGB8888);
+        n = client_read_update(&c, img, W, H, rects, 64);
+        TCHECK_EQ(n, 1);
+        TCHECK_EQ(c.last_enc, CSVNC_ENC_RAW);
+    }
+
     /* keys and the pointer reach the callbacks with the user pointer */
     {
         uint8_t key[8] = { 4, 1, 0, 0, 0, 0, 0xff, 0x0d };
@@ -541,6 +632,22 @@ static void test_slow_and_bad_clients(void)
     /* the slow one is still connected and has a bounded region */
     TCHECK_EQ(csvnc_client_count(s), 2);
     TCHECK(!slow.eof);
+    {
+        csvnc_client_state info;
+        int found = 0;
+
+        /* the slow client: pending region bounded, buffer full of
+         * one unsent update, or an update in flight */
+        for (i = 0; i < 2; i++) {
+            TCHECK_EQ(csvnc_client_info(s, i, &info), 0);
+            TCHECK(info.established);
+            TCHECK(info.pending_rects <= CSVNC_REGION_MAX);
+            TCHECK(info.pending_area <= (long)W * H);
+            if (info.pending_rects > 0 || info.in_update || info.queued_bytes > 0)
+                found = 1;
+        }
+        TCHECK(found);
+    }
     /* now it reads: it gets a consistent frame eventually */
     for (i = 0; i < 100; i++) {
         service();
@@ -578,6 +685,19 @@ static void test_slow_and_bad_clients(void)
     n = client_read_update(&fast, img, W, H, rects, 64);
     TCHECK_EQ(n, 1);
     TCHECK(memcmp(img, frame, sizeof(img)) == 0);
+
+    /* drop_clients closes it (and a fresh one) but keeps the listener */
+    TCHECK_EQ(client_connect(&bad, port), 0);
+    TCHECK(client_wait(&bad, 12));
+    csvnc_drop_clients(s);
+    TCHECK(client_wait_eof(&fast));
+    TCHECK(client_wait_eof(&bad));
+    client_close(&fast);
+    client_close(&bad);
+    TCHECK_EQ(csvnc_client_count(s), 0);
+    TCHECK_EQ(client_connect(&fast, port), 0);
+    TCHECK_EQ(client_handshake(&fast, W, H), 0);
+    TCHECK_EQ(csvnc_client_count(s), 1);
 
     /* destroy with a live client: it sees EOF */
     csvnc_destroy(s);

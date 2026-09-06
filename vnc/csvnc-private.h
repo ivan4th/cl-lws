@@ -134,7 +134,7 @@ int csvnc_region_pop(csvnc_region *rg, int max_rows, csvnc_rect *out);
 
 typedef struct csvnc_encoder {
     int32_t enc;               /* CSVNC_ENC_* in use */
-    void *zrle;                /* reserved for the ZRLE stream */
+    void *zrle;                /* csvnc_zrle: the client's zlib stream */
 } csvnc_encoder;
 
 void csvnc_encoder_init(csvnc_encoder *e);
@@ -156,6 +156,15 @@ size_t csvnc_encode_hextile(const csvnc_pixfmt *f, const csvnc_fb *fb,
                             int x, int y, int w, int h,
                             uint8_t *out, size_t cap);
 size_t csvnc_hextile_max_size(const csvnc_pixfmt *f, int w, int h);
+
+/* ZRLE (csvnc-zrle.c): the zlib stream is created on first use and
+ * lives until csvnc_encoder_free / csvnc_zrle_free. */
+size_t csvnc_encode_zrle(csvnc_encoder *e, const csvnc_pixfmt *f,
+                         const csvnc_fb *fb, int x, int y, int w, int h,
+                         uint8_t *out, size_t cap);
+size_t csvnc_zrle_max_size(const csvnc_pixfmt *f, int w, int h);
+size_t csvnc_zrle_cpixel_bytes(const csvnc_pixfmt *f);
+void csvnc_zrle_free(csvnc_encoder *e);
 
 /* Server-to-client message pieces. */
 #define CSVNC_UPDATE_HDR_SIZE 4

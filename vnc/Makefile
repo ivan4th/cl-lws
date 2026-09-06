@@ -12,7 +12,7 @@ else
 endif
 
 # pure-logic objects: no libwebsockets dependency, linked into tests
-PURE_OBJS = csvnc-rfb.o csvnc-pixfmt.o csvnc-encode.o csvnc-region.o csvnc-keys.o
+PURE_OBJS = csvnc-rfb.o csvnc-pixfmt.o csvnc-encode.o csvnc-zrle.o csvnc-region.o csvnc-keys.o
 # lws-facing objects
 LWS_OBJS = csvnc-lws.o
 
@@ -26,10 +26,10 @@ LWS_TESTS = tests/test-server
 FUZZERS = tests/fuzz-handshake tests/fuzz-messages tests/fuzz-encode
 FUZZ_CC ?= clang
 FUZZ_FLAGS = -g -O1 -std=c99 -DCSVNC_LIBFUZZER \
-             -fsanitize=fuzzer,address,undefined -I.
+             -fsanitize=fuzzer,address,undefined -I. -lz
 # standalone (no libFuzzer) build of the same harnesses under ASan/UBSan:
 # make fuzz-standalone && ./tests/fuzz-handshake-sa 200000
-SA_FLAGS = -g -O1 -std=c99 -fsanitize=address,undefined -I.
+SA_FLAGS = -g -O1 -std=c99 -fsanitize=address,undefined -I. -lz
 PURE_SRCS = $(PURE_OBJS:.o=.c)
 
 all: $(LIB)
@@ -39,10 +39,10 @@ $(LIB): $(OBJS)
 
 $(OBJS): csvnc.h csvnc-private.h Makefile
 
-tests/test-%: tests/test-%.c tests/test-util.h $(PURE_OBJS) csvnc.h csvnc-private.h
-	$(CC) $(CFLAGS) -o $@ $< $(PURE_OBJS)
+tests/test-%: tests/test-%.c tests/test-util.h tests/zrle-ref.h $(PURE_OBJS) csvnc.h csvnc-private.h
+	$(CC) $(CFLAGS) -o $@ $< $(PURE_OBJS) -lz
 
-tests/test-server: tests/test-server.c tests/test-util.h $(OBJS) csvnc.h csvnc-private.h
+tests/test-server: tests/test-server.c tests/test-util.h tests/zrle-ref.h $(OBJS) csvnc.h csvnc-private.h
 	$(CC) $(CFLAGS) -o $@ $< $(OBJS) $(LDFLAGS)
 
 check: $(TESTS) $(LWS_TESTS)

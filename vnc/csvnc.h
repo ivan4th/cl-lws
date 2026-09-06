@@ -70,6 +70,12 @@ int csvnc_lws_protocol_callback(struct lws *wsi, int reason,
 /* The port actually bound (useful with port 0). */
 int csvnc_listen_port(const csvnc_server *s);
 
+/* Update semantics: a client's FramebufferUpdateRequest is answered
+ * with everything dirty since its last update (the request's own
+ * rectangle only matters for incremental = 0, where it is marked
+ * dirty); an incremental request with nothing dirty waits, silently,
+ * for the next blit. */
+
 /* Copy a W x H block of pixels at (X, Y) into the shadow framebuffer
  * and mark what actually changed dirty for every client (the block is
  * compared against the shadow, so a display that flushes the whole
@@ -83,6 +89,26 @@ void csvnc_blit(csvnc_server *s, int x, int y, int w, int h,
 
 /* Number of clients that completed the handshake. */
 int csvnc_client_count(const csvnc_server *s);
+
+/* A snapshot of one client's state, for tests and diagnostics. */
+typedef struct csvnc_client_info {
+    int established;        /* past the handshake */
+    int pending_rects;      /* dirty rectangles waiting for a request */
+    long pending_area;      /* their total area in pixels */
+    int in_update;          /* a FramebufferUpdate is being streamed */
+    int update_requested;   /* a request is waiting for dirty pixels */
+    size_t queued_bytes;    /* output bytes generated but not yet written */
+    int32_t encoding;       /* the encoding the next update will use */
+    int bpp;                /* the client's pixel format depth in bits */
+} csvnc_client_state;
+
+/* Fill *OUT for the INDEX-th connected client (any handshake state,
+ * newest first).  Returns 0, or -1 when there is no such client. */
+int csvnc_client_info(const csvnc_server *s, int index,
+                      csvnc_client_state *out);
+
+/* Close every client connection (the listener stays). */
+void csvnc_drop_clients(csvnc_server *s);
 
 /* Drop all clients, close the listener, free everything. */
 void csvnc_destroy(csvnc_server *s);

@@ -170,6 +170,7 @@ static void consider_encoding(csvnc_rfb *c, int32_t enc)
     switch (enc) {
     case CSVNC_ENC_RAW:
     case CSVNC_ENC_HEXTILE:
+    case CSVNC_ENC_ZRLE:
         /* the client lists encodings in preference order: keep the
          * first one we support */
         if (!c->enc_chosen) {

@@ -5,6 +5,7 @@
 
 #include "../csvnc-private.h"
 #include "test-util.h"
+#include "zrle-ref.h"
 
 static uint32_t rng_state = 4242;
 
@@ -435,7 +436,7 @@ static void test_encode_rect(void)
     TCHECK_EQ(buf[17], 0);
     /* unsupported encodings fall back to Raw */
     csvnc_encoder_select(&e, CSVNC_ENC_ZRLE);
-    TCHECK_EQ(e.enc, CSVNC_ENC_RAW);
+    TCHECK_EQ(e.enc, CSVNC_ENC_ZRLE);
     csvnc_encoder_select(&e, 7);
     TCHECK_EQ(e.enc, CSVNC_ENC_RAW);
     /* out-of-frame or empty rectangles are refused */
@@ -458,5 +459,239 @@ static void test_encode_rect(void)
     TCHECK_EQ((int32_t)csvnc_get_u32(buf + 8), -224);
 }
 
+/* ---- ZRLE ---- */
+
+static const struct {
+    int bpp, depth, be, rmax, gmax, bmax, rs, gs, bs, cpixel;
+} zformats[] = {
+    { 32, 24, 0, 255, 255, 255, 16, 8, 0, 3 },    /* native: LS 3 bytes */
+    { 32, 24, 0, 255, 255, 255, 0, 8, 16, 3 },    /* noVNC */
+    { 32, 24, 1, 255, 255, 255, 16, 8, 0, 3 },    /* big-endian, LS 3 -> offset 1 */
+    { 32, 24, 1, 255, 255, 255, 24, 16, 8, 3 },   /* big-endian, MS 3 */
+    { 32, 24, 0, 255, 255, 255, 24, 16, 8, 3 },   /* LE with MS 3 -> offset 1 */
+    { 32, 32, 0, 255, 255, 255, 16, 8, 0, 4 },    /* depth 32: 4 bytes */
+    { 32, 24, 0, 255, 255, 255, 20, 10, 0, 4 },   /* straddles: 4 bytes */
+    { 16, 16, 0, 31, 63, 31, 11, 5, 0, 2 },
+    { 16, 16, 1, 31, 63, 31, 11, 5, 0, 2 },
+    { 8, 8, 0, 7, 7, 3, 5, 2, 0, 1 },
+};
+#define NZFORMATS (sizeof(zformats) / sizeof(zformats[0]))
+
+static void make_zfmt(csvnc_pixfmt *f, size_t i)
+{
+    uint8_t w[16];
+
+    memset(w, 0, 16);
+    w[0] = (uint8_t)zformats[i].bpp;
+    w[1] = (uint8_t)zformats[i].depth;
+    w[2] = (uint8_t)zformats[i].be;
+    w[3] = 1;
+    csvnc_put_u16(w + 4, (unsigned)zformats[i].rmax);
+    csvnc_put_u16(w + 6, (unsigned)zformats[i].gmax);
+    csvnc_put_u16(w + 8, (unsigned)zformats[i].bmax);
+    w[10] = (uint8_t)zformats[i].rs;
+    w[11] = (uint8_t)zformats[i].gs;
+    w[12] = (uint8_t)zformats[i].bs;
+    TCHECK_EQ(csvnc_pixfmt_parse(f, w), 0);
+    TCHECK_EQ(csvnc_zrle_cpixel_bytes(f), zformats[i].cpixel);
+}
+
+/* Encode (x,y,w,h) with the encoder's ZRLE stream, decode with the
+ * matching reference stream, compare.  Returns the encoded size. */
+static size_t zrle_round_trip(csvnc_encoder *e, zrle_ref *z, const csvnc_pixfmt *f,
+                              const csvnc_fb *fb, int x, int y, int w, int h)
+{
+    size_t cap = csvnc_zrle_max_size(f, w, h);
+    uint8_t *buf = malloc(cap + 16);
+    uint32_t *dec = malloc((size_t)w * h * sizeof(uint32_t));
+    size_t n;
+    long used;
+    int i, j, bad = 0;
+
+    memset(buf, 0xa5, cap + 16);
+    n = csvnc_encode_zrle(e, f, fb, x, y, w, h, buf, cap);
+    TCHECK(n > 0);
+    TCHECK(n <= cap);
+    for (i = 0; i < 16; i++)
+        TCHECK_EQ(buf[cap + i], 0xa5);
+    used = zrle_ref_decode(z, f, buf, n, w, h, dec);
+    TCHECK_EQ(used, (long)n);
+    if (used == (long)n) {
+        for (j = 0; j < h && !bad; j++)
+            for (i = 0; i < w; i++) {
+                uint32_t expect = csvnc_pix_translate(f, fb->px[(y + j) * fb->width + x + i]);
+
+                if (dec[j * w + i] != expect) {
+                    TFAIL("zrle pixel (%d,%d) of %dx%d rect at (%d,%d): %x != %x",
+                          i, j, w, h, x, y, dec[j * w + i], expect);
+                    bad = 1;
+                    break;
+                }
+            }
+    }
+    free(buf);
+    free(dec);
+    return n;
+}
+
+static void test_zrle_round_trip(void)
+{
+    static const struct { int w, h; } sizes[] = {
+        { 64, 64 }, { 1, 1 }, { 65, 64 }, { 64, 65 }, { 37, 23 },
+        { 130, 3 }, { 3, 130 }, { 63, 63 }, { 200, 100 },
+    };
+    size_t fi, si;
+    int kind;
+
+    for (fi = 0; fi < NZFORMATS; fi++) {
+        csvnc_pixfmt f;
+        csvnc_encoder e;
+        zrle_ref z;
+
+        make_zfmt(&f, fi);
+        /* one stream for the whole sequence, as one client would */
+        csvnc_encoder_init(&e);
+        csvnc_encoder_select(&e, CSVNC_ENC_ZRLE);
+        zrle_ref_init(&z);
+        for (kind = 0; kind < FR_N; kind++) {
+            for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
+                csvnc_fb fb;
+                int w = sizes[si].w, h = sizes[si].h;
+
+                TCHECK_EQ(csvnc_fb_init(&fb, w + 7, h + 5), 0);
+                fill_frame(&fb, (frame_kind)kind);
+                zrle_round_trip(&e, &z, &f, &fb, 0, 0, fb.width, fb.height);
+                zrle_round_trip(&e, &z, &f, &fb, 3, 2, w, h);
+                zrle_round_trip(&e, &z, &f, &fb, 7, 5, w, h);
+                csvnc_fb_free(&fb);
+            }
+        }
+        TCHECK(e.zrle != NULL);
+        csvnc_encoder_free(&e);
+        TCHECK(e.zrle == NULL);
+        zrle_ref_free(&z);
+    }
+}
+
+static void test_zrle_subencodings(void)
+{
+    /* each tile kind picks the expected subencoding and beats raw */
+    csvnc_pixfmt f;
+    csvnc_encoder e;
+    zrle_ref z;
+    csvnc_fb fb;
+    uint8_t buf[65536];
+    size_t n;
+    int i;
+
+    make_zfmt(&f, 1);   /* noVNC: 3-byte CPIXEL */
+    csvnc_encoder_init(&e);
+    csvnc_encoder_select(&e, CSVNC_ENC_ZRLE);
+    zrle_ref_init(&z);
+    TCHECK_EQ(csvnc_fb_init(&fb, 64, 64), 0);
+
+    /* solid: a whole tile is a few bytes */
+    for (i = 0; i < 64 * 64; i++)
+        fb.px[i] = 0x336699;
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    TCHECK(n < 4 + 16);
+    TCHECK_EQ(z.buf[0], 1);
+
+    /* two colours in long runs: palette RLE (130) */
+    for (i = 0; i < 64 * 64; i++)
+        fb.px[i] = (i / 64) % 8 < 4 ? 0x336699 : 0xffffff;
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    TCHECK_EQ(z.buf[0], 130);
+    TCHECK(z.len < 64);
+
+    /* two colours alternating every pixel: packed palette, 1 bit */
+    for (i = 0; i < 64 * 64; i++)
+        fb.px[i] = ((i % 64) + (i / 64)) & 1 ? 0xffffff : 0;
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    TCHECK_EQ(z.buf[0], 2);
+    TCHECK_EQ(z.len, 1 + 2 * 3 + 64 * 8);
+
+    /* 16 colours alternating: packed palette, 4 bits */
+    for (i = 0; i < 64 * 64; i++)
+        fb.px[i] = 0x111111u * (uint32_t)((i % 64 + i / 64) % 16);
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    TCHECK_EQ(z.buf[0], 16);
+    TCHECK_EQ(z.len, 1 + 16 * 3 + 64 * 32);
+
+    /* many colours in long runs: plain RLE (128) */
+    for (i = 0; i < 64 * 64; i++)
+        fb.px[i] = 0x010203u * (uint32_t)(i / 32);
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    TCHECK_EQ(z.buf[0], 128);
+    TCHECK_EQ(z.len, 1 + 128 * (3 + 1));
+
+    /* noise: raw */
+    fill_frame(&fb, FR_NOISE);
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    TCHECK_EQ(z.buf[0], 0);
+    TCHECK_EQ(z.len, 1 + 64 * 64 * 3);
+
+    /* a run longer than 255 encodes its length in continuation bytes */
+    for (i = 0; i < 64 * 64; i++)
+        fb.px[i] = i < 3000 ? 0x102030 : 0x405060;
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 64, 64);
+    /* two runs: plain RLE (pixel + length) beats a palette here:
+     * run 3000 = 3 + (2999/255=11)+1 bytes, run 1096 = 3 + 5 */
+    TCHECK_EQ(z.buf[0], 128);
+    TCHECK_EQ(z.len, 1 + (3 + 12) + (3 + 5));
+
+    /* buffer too small: refused, nothing written past cap */
+    memset(buf, 0xee, sizeof(buf));
+    n = csvnc_encode_zrle(&e, &f, &fb, 0, 0, 64, 64, buf, 3);
+    TCHECK_EQ(n, 0);
+    TCHECK_EQ(buf[3], 0xee);
+
+    csvnc_fb_free(&fb);
+    csvnc_encoder_free(&e);
+    zrle_ref_free(&z);
+}
+
+static void test_zrle_full_frame(void)
+{
+    /* the console frame: flat, dotted, noise; sizes bounded by
+     * csvnc_zrle_max_size in the worst case */
+    csvnc_pixfmt f;
+    csvnc_encoder e;
+    zrle_ref z;
+    csvnc_fb fb;
+    size_t n;
+
+    make_zfmt(&f, 1);
+    csvnc_encoder_init(&e);
+    csvnc_encoder_select(&e, CSVNC_ENC_ZRLE);
+    zrle_ref_init(&z);
+    TCHECK_EQ(csvnc_fb_init(&fb, 640, 480), 0);
+    fill_frame(&fb, FR_FLAT);
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 640, 480);
+    TCHECK(n < 200);
+    fill_frame(&fb, FR_DOTS);
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 640, 480);
+    TCHECK(n < 640 * 480 * 3 / 20);
+    fill_frame(&fb, FR_NOISE);
+    n = zrle_round_trip(&e, &z, &f, &fb, 0, 0, 640, 480);
+    TCHECK(n <= csvnc_zrle_max_size(&f, 640, 480));
+    TCHECK(n > 640 * 480 * 3 * 9 / 10);
+    /* the same through the dispatcher, header included */
+    {
+        size_t cap = csvnc_encode_max_size(&e, &f, 640, 64);
+        uint8_t *buf = malloc(cap);
+
+        n = csvnc_encode_rect(&e, &f, &fb, 0, 0, 640, 64, buf, cap);
+        TCHECK(n > 12);
+        TCHECK(n <= cap);
+        TCHECK_EQ((int32_t)csvnc_get_u32(buf + 8), CSVNC_ENC_ZRLE);
+        free(buf);
+    }
+    csvnc_fb_free(&fb);
+    csvnc_encoder_free(&e);
+    zrle_ref_free(&z);
+}
+
 TEST_MAIN(test_hextile_round_trip, test_hextile_full_frame, test_hextile_costs,
-          test_raw, test_encode_rect)
+          test_raw, test_encode_rect, test_zrle_round_trip,
+          test_zrle_subencodings, test_zrle_full_frame)

@@ -310,8 +310,8 @@ static const uint8_t msg_set_pixel_format[] = {
 };
 static const uint8_t msg_set_encodings[] = {
     2, 0, 0, 5,
-    0xff, 0xff, 0xff, 0xff,     /* CopyRect (-1)? no: 0xffffffff = -1 = unsupported */
-    0x00, 0x00, 0x00, 0x10,     /* ZRLE (unsupported in M1) */
+    0xff, 0xff, 0xff, 0xff,     /* -1: unsupported */
+    0x00, 0x00, 0x00, 0x10,     /* ZRLE: the first supported one wins */
     0x00, 0x00, 0x00, 0x05,     /* Hextile */
     0xff, 0xff, 0xff, 0x20,     /* LastRect (-224) */
     0x00, 0x00, 0x00, 0x00      /* Raw */
@@ -354,7 +354,7 @@ static void test_messages_all(void)
         TCHECK(csvnc_rfb_established(&c));
         if (strcmp(r.log,
                    "pf(32,24,0,255/255/255,0/8/16);"
-                   "enc(5,lr=1);"
+                   "enc(16,lr=1);"
                    "fbur(1,10,20,640,480);"
                    "key(ff0d,1);"
                    "key(61,0);"
@@ -377,9 +377,9 @@ static void test_set_encodings_preference(void)
     static const uint8_t raw_first[] = {
         2, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5
     };
-    /* nothing we support: Raw */
+    /* nothing we support (Tight, Zlib): Raw */
     static const uint8_t none[] = {
-        2, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 16
+        2, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 6
     };
     csvnc_rfb c;
     rec r;
@@ -388,7 +388,7 @@ static void test_set_encodings_preference(void)
     TCHECK_EQ(feed_bytewise(&c, raw_first, sizeof(raw_first)), 0);
     TCHECK_EQ(c.enc, CSVNC_ENC_RAW);
     TCHECK_EQ(feed_bytewise(&c, msg_set_encodings, sizeof(msg_set_encodings)), 0);
-    TCHECK_EQ(c.enc, CSVNC_ENC_HEXTILE);
+    TCHECK_EQ(c.enc, CSVNC_ENC_ZRLE);
     TCHECK_EQ(c.lastrect, 1);
     TCHECK_EQ(feed_bytewise(&c, none, sizeof(none)), 0);
     TCHECK_EQ(c.enc, CSVNC_ENC_RAW);

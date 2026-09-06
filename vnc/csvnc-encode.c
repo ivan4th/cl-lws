@@ -1,6 +1,6 @@
-/* Framebuffer encoders: Raw and Hextile, plus the FramebufferUpdate
- * message/rectangle headers.  ZRLE (zlib) plugs into csvnc_encode_rect
- * and csvnc_encoder later; the seam is the encoder struct + dispatch. */
+/* Framebuffer encoders: Raw and Hextile here, ZRLE in csvnc-zrle.c,
+ * plus the FramebufferUpdate message/rectangle headers and the
+ * per-encoding dispatch. */
 
 #include "csvnc-private.h"
 
@@ -29,14 +29,14 @@ void csvnc_encoder_init(csvnc_encoder *e)
 
 void csvnc_encoder_free(csvnc_encoder *e)
 {
-    /* ZRLE stream teardown goes here */
-    e->zrle = NULL;
+    csvnc_zrle_free(e);
 }
 
 void csvnc_encoder_select(csvnc_encoder *e, int32_t enc)
 {
     switch (enc) {
     case CSVNC_ENC_HEXTILE:
+    case CSVNC_ENC_ZRLE:
         e->enc = enc;
         break;
     default:
@@ -298,6 +298,9 @@ size_t csvnc_encode_max_size(const csvnc_encoder *e, const csvnc_pixfmt *f,
     case CSVNC_ENC_HEXTILE:
         payload = csvnc_hextile_max_size(f, w, h);
         break;
+    case CSVNC_ENC_ZRLE:
+        payload = csvnc_zrle_max_size(f, w, h);
+        break;
     default:
         payload = (size_t)w * (size_t)h * f->bytespp;
         break;
@@ -319,6 +322,11 @@ size_t csvnc_encode_rect(csvnc_encoder *e, const csvnc_pixfmt *f,
         n = csvnc_encode_hextile(f, fb, x, y, w, h,
                                  out + CSVNC_RECT_HDR_SIZE,
                                  cap - CSVNC_RECT_HDR_SIZE);
+        break;
+    case CSVNC_ENC_ZRLE:
+        n = csvnc_encode_zrle(e, f, fb, x, y, w, h,
+                              out + CSVNC_RECT_HDR_SIZE,
+                              cap - CSVNC_RECT_HDR_SIZE);
         break;
     default:
         n = csvnc_encode_raw(f, fb, x, y, w, h, out + CSVNC_RECT_HDR_SIZE,
