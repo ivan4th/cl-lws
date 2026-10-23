@@ -30,7 +30,8 @@ $(OBJS): cscompress.h Makefile
 tests/test-%: tests/test-%.c tests/test-util.h $(OBJS) cscompress.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(OBJS) $(LDFLAGS)
 
-check: $(TESTS)
+# the library too: CI builds and checks in one go, then installs it
+check: $(LIB) $(TESTS)
 	@set -e; for t in $(TESTS); do echo "== $$t"; ./$$t; done; echo "cscompress: all C tests passed"
 
 clean:
