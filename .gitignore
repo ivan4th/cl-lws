@@ -40,3 +40,7 @@ vnc/tests/fuzz-encode
 vnc/tests/*-sa
 vnc/tests/*.dSYM/
 vnc/tests/test-server
+compress/*.o
+compress/libcscompress.*
+compress/tests/test-compress
+compress/tests/*.dSYM/

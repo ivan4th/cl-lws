@@ -8,5 +8,7 @@
   :pathname "tests"
   :components ((:file "package")
                (:file "lws-test")
+               (:file "http-test")
                (:file "modbus-test"))
-  :depends-on (:lws :vtf :bordeaux-threads))
+  :depends-on (:lws :vtf :bordeaux-threads :babel :split-sequence
+               #+sbcl (:require :sb-bsd-sockets)))

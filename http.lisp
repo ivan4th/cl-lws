@@ -9,13 +9,34 @@
 ;;;
 ;;; The handler receives the request and may respond immediately or
 ;;; later via HTTP-RESPOND; the response is emitted from the WRITEABLE
-;;; callback in two phases (headers, then body).
+;;; callback, headers first, then the body in chunks of
+;;; *HTTP-WRITE-CHUNK-SIZE*.  lws calls WRITEABLE only once it has
+;;; handed everything written before to the kernel, so each chunk is
+;;; progress, and the lws timeout re-armed with every chunk only drops
+;;; a connection whose peer stopped reading -- a slow one may take as
+;;; long as it needs.
+;;;
+;;; Bodies are compressed with a content coding the client accepts when
+;;; any are registered (REGISTER-HTTP-CONTENT-CODING; the LWS-COMPRESS
+;;; system registers zstd and gzip).
 
 (defvar *http-max-body-size* (* 1024 1024)
   "Maximum accepted request body size; larger requests get 413.")
 
 (defvar *http-response-timeout-secs* 75
   "How long lws waits for a deferred response before closing.")
+
+(defvar *http-send-timeout-secs* 30
+  "How long a response being sent may make no progress -- lws unable to
+take the next body chunk because the peer stopped reading -- before lws
+drops the connection.  There is no limit on the total time.")
+
+(defconstant +http-tx-packet-size+ 16384
+  "The most lws sends at once on an HTTP connection (the protocol's
+tx_packet_size), so that a body chunk usually goes out in one send.")
+
+(defvar *http-write-chunk-size* +http-tx-packet-size+
+  "Response body bytes handed to lws per WRITEABLE callback.")
 
 (defstruct (http-server (:constructor %make-http-server (context handler)))
   id
@@ -45,7 +66,8 @@
   body         ;; octets, set on body completion
   dispatched-p
   response     ;; plist (:status :content-type :headers :body)
-  response-state) ;; nil -> :headers-sent
+  response-state ;; nil -> :headers-sent
+  (body-offset 0)) ;; response body bytes already handed to lws
 
 ;;; request accessors
 
@@ -99,7 +121,8 @@
            (iter (for (name token) in '(("origin" :wsi-token-origin)
                                         ("authorization" :wsi-token-http-authorization)
                                         ("cookie" :wsi-token-http-cookie)
-                                        ("content-type" :wsi-token-http-content-type)))
+                                        ("content-type" :wsi-token-http-content-type)
+                                        ("accept-encoding" :wsi-token-http-accept-encoding)))
                  (when-let ((value (%hdr-by-token wsi token)))
                    (collect (cons name value))))
            (iter (for name in (http-server-capture-headers server))
@@ -184,13 +207,159 @@ materialize into requests.  Returns an http-server."
     (http-server-free server))
   (values))
 
+;;; content codings
+
+(defvar *http-content-codings* '()
+  "Content codings HTTP-RESPOND may apply to a response body, most
+preferred first: a list of (NAME . FUNCTION), NAME a lowercase
+Content-Encoding token, FUNCTION taking the body octets and returning
+the encoded octets, or NIL to send the body as it is.  Empty unless a
+system such as LWS-COMPRESS registers some.")
+
+(defun register-http-content-coding (name function)
+  "Make the content coding NAME available to HTTP-RESPOND, encoding with
+FUNCTION (see *HTTP-CONTENT-CODINGS*).  A new coding is the least
+preferred one; registering NAME again replaces its function in place."
+  (let ((name (string-downcase name)))
+    (if-let ((existing (assoc name *http-content-codings* :test #'equal)))
+      (setf (cdr existing) function)
+      (setf *http-content-codings*
+            (append *http-content-codings* (list (cons name function))))))
+  (values))
+
+(defvar *http-compress-min-size* 1024
+  "Bodies shorter than this are sent as they are: encoding them saves
+next to nothing.")
+
+(defun http-compressible-content-type-p (content-type)
+  "True for the textual media types worth compressing."
+  (let* ((semicolon (position #\; content-type))
+         (type (string-downcase
+                (string-trim " " (subseq content-type 0 semicolon)))))
+    (or (starts-with-subseq "text/" type)
+        (member type '("application/json" "application/javascript"
+                       "application/xml" "image/svg+xml")
+                :test #'equal)
+        (ends-with-subseq "+json" type)
+        (ends-with-subseq "+xml" type))))
+
+(defun %split-and-trim (char string)
+  (iter (for start first 0 then (1+ end))
+        (for end = (position char string :start start))
+        (collect (string-trim '(#\Space #\Tab) (subseq string start end)))
+        (while end)))
+
+(defun %parse-qvalue (string)
+  "The qvalue STRING (\"0.5\", \"1\", ...) in thousandths, or NIL if it
+isn't a well-formed one."
+  (let ((len (length string)))
+    (when (and (<= 1 len 5)
+               (digit-char-p (char string 0))
+               (or (= len 1)
+                   (and (char= #\. (char string 1))
+                        (every #'digit-char-p (subseq string 2)))))
+      (let ((value (+ (* 1000 (digit-char-p (char string 0)))
+                      (iter (for i from 2 below len)
+                            (for scale in '(100 10 1))
+                            (sum (* scale (digit-char-p (char string i))))))))
+        (when (<= value 1000)
+          value)))))
+
+(defun parse-accept-encoding (header)
+  "Parse an Accept-Encoding header value into a list of (CODING . Q),
+CODING lowercased, Q the qvalue in thousandths (1000 when not given).
+Malformed elements are left out."
+  (iter (for element in (%split-and-trim #\, header))
+        (for (coding . params) = (%split-and-trim #\; element))
+        (unless (emptyp coding)
+          (let ((q 1000))
+            (dolist (param params)
+              (let ((eq-pos (position #\= param)))
+                (when (and eq-pos
+                           (string-equal "q" (string-trim " " (subseq param 0 eq-pos))))
+                  (setf q (%parse-qvalue
+                           (string-trim " " (subseq param (1+ eq-pos))))))))
+            (when q
+              (collect (cons (string-downcase coding) q)))))))
+
+(defun http-choose-content-coding (accept-encoding
+                                   &optional (codings *http-content-codings*))
+  "The entry of CODINGS to encode a response with, given the request's
+Accept-Encoding header value ACCEPT-ENCODING (NIL when the request had
+none): the coding the client weighs highest, the one earlier in CODINGS
+on a tie.  NIL when the client accepts none of them.  A request without
+Accept-Encoding gets none either, although RFC 9110 would allow any:
+such clients rarely expect it."
+  (when accept-encoding
+    (let* ((accepted (parse-accept-encoding accept-encoding))
+           (wildcard (assoc-value accepted "*" :test #'equal)))
+      (flet ((weight (name)
+               ;; a coding named explicitly, even with q=0, overrides
+               ;; the wildcard
+               (or (assoc-value accepted name :test #'equal)
+                   (and (equal "gzip" name)
+                        (assoc-value accepted "x-gzip" :test #'equal))
+                   wildcard
+                   0)))
+        (iter (with best = nil)
+              (with best-weight = 0)
+              (for entry in codings)
+              (for weight = (weight (car entry)))
+              (when (> weight best-weight)
+                (setf best entry
+                      best-weight weight))
+              (finally (return best)))))))
+
+(defun %add-vary (headers field)
+  (let ((vary (assoc "vary" headers :test #'string-equal)))
+    (cond ((null vary)
+           (append headers (list (cons "vary" field))))
+          ((or (equal "*" (cdr vary))
+               (member field (%split-and-trim #\, (cdr vary)) :test #'string-equal))
+           headers)
+          (t
+           (substitute (cons (car vary) (format nil "~a, ~a" (cdr vary) field))
+                       vary headers)))))
+
+(defun %encode-response (request status content-type headers body)
+  "Apply a content coding the client accepts to BODY when it is worth it.
+Returns the body and the headers to send."
+  (when (or (null *http-content-codings*)
+            (null content-type)
+            (not (http-compressible-content-type-p content-type))
+            (member status '(204 304))
+            (assoc "content-encoding" headers :test #'string-equal)
+            ;; a strong validator must differ between codings (RFC 9110
+            ;; 8.8.3), and the handler's names the unencoded body
+            (assoc "etag" headers :test #'string-equal))
+    (return-from %encode-response (values body headers)))
+  ;; the representation depends on Accept-Encoding even when this one
+  ;; goes out unencoded
+  (let* ((headers (%add-vary headers "Accept-Encoding"))
+         (coding (and (>= (length body) *http-compress-min-size*)
+                      (http-choose-content-coding
+                       (http-request-header request "accept-encoding"))))
+         (encoded (when coding
+                    (handler-case (funcall (cdr coding) body)
+                      (error (condition)
+                        (warn "http: ~a encoding failed: ~a" (car coding) condition)
+                        nil)))))
+    (if (and encoded (< (length encoded) (length body)))
+        (values encoded
+                (append headers (list (cons "content-encoding" (car coding)))))
+        (values body headers))))
+
 ;;; responding
 
 (defun http-respond (request &key (status 200) (content-type "text/html")
                                headers body)
   "Set the response for REQUEST and kick its emission.  BODY is a string
 or an octet vector.  HEADERS is an alist of (name . value) strings.
-No-op if the connection is already gone.  Event loop thread only."
+The body is compressed with a registered content coding when the client
+accepts one, CONTENT-TYPE is textual, the body is at least
+*HTTP-COMPRESS-MIN-SIZE* long and STATUS is not 204 or 304, unless
+HEADERS already has a Content-Encoding or an ETag.  No-op if the
+connection is already gone.  Event loop thread only."
   (when (stringp body)
     (setf body (babel:string-to-octets body :encoding :utf-8)))
   (cond ((not (http-request-alive-p request))
@@ -198,9 +367,17 @@ No-op if the connection is already gone.  Event loop thread only."
         ((http-request-response request)
          (warn "http-respond: response already set"))
         (t
-         (setf (http-request-response request)
-               (list :status status :content-type content-type
-                     :headers headers :body (or body #())))
+         (multiple-value-bind (body headers)
+             (%encode-response request status content-type headers (or body #()))
+           (setf (http-request-response request)
+                 (list :status status :content-type content-type
+                       :headers headers :body body)))
+         ;; restart the clock now: the request's own deadline (or the
+         ;; deferred-response one) may be nearly spent, and
+         ;; %EMIT-RESPONSE-BODY re-arms it only from the first body
+         ;; chunk on
+         (%lws-set-timeout (http-request-wsi request) :pending-timeout-http-content
+                           *http-send-timeout-secs*)
          (%lws-callback-on-writable (http-request-wsi request))))
   (values))
 
@@ -233,15 +410,26 @@ No-op if the connection is already gone.  Event loop thread only."
              0)))))
 
 (defun %emit-response-body (request wsi)
-  (let* ((response (http-request-response request))
-         (body (getf response :body))
-         (len (length body))
-         (buf (context-scratch (http-request-context request) (+ +lws-pre+ len)))
+  "Hand the next body chunk to lws, the last one as LWS_WRITE_HTTP_FINAL."
+  (let* ((body (getf (http-request-response request) :body))
+         (offset (http-request-body-offset request))
+         (count (min *http-write-chunk-size* (- (length body) offset)))
+         (final-p (= (+ offset count) (length body)))
+         (buf (context-scratch (http-request-context request) (+ +lws-pre+ count)))
          (payload (cffi:inc-pointer buf +lws-pre+)))
-    (copy-octets-to-foreign body payload)
-    (if (< (%lws-write wsi payload len :lws-write-http-final) len)
-        -1
-        (%finish-http-transaction request wsi))))
+    (copy-octets-to-foreign body payload :start offset :end (+ offset count))
+    ;; this callback means the previous chunk is with the kernel
+    (%lws-set-timeout wsi :pending-timeout-http-content *http-send-timeout-secs*)
+    (cond ((< (%lws-write wsi payload count
+                          (if final-p :lws-write-http-final :lws-write-http))
+              count)
+           -1)
+          (final-p
+           (%finish-http-transaction request wsi))
+          (t
+           (setf (http-request-body-offset request) (+ offset count))
+           (%lws-callback-on-writable wsi)
+           0))))
 
 (defun %finish-http-transaction (request wsi)
   (%request-done request)
@@ -329,4 +517,5 @@ No-op if the connection is already gone.  Event loop thread only."
    0))
 
 (register-lws-protocol "cs-http" #'(lambda () (cffi:callback http-callback))
-                       :default t)
+                       :default t
+                       :tx-packet-size +http-tx-packet-size+)

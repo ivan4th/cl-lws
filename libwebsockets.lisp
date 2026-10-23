@@ -32,3 +32,15 @@
            cffi:*foreign-library-directories*
            :test #'equal)
   (cffi:use-foreign-library libcsvnc))
+
+;; The cscompress gzip/zstd compressor (compress/, built by
+;; lws-compress.asd's COMPRESS-C-LIBRARY component); loaded the same
+;; way as libcsmodbus.
+(cffi:define-foreign-library libcscompress
+  (t (:default "libcscompress")))
+
+(defun load-libcscompress (build-path)
+  (pushnew (uiop:pathname-directory-pathname build-path)
+           cffi:*foreign-library-directories*
+           :test #'equal)
+  (cffi:use-foreign-library libcscompress))

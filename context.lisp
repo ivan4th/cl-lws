@@ -10,13 +10,16 @@
 ;;; thunk queue + lws_cancel_service wakeup).
 
 (defvar *lws-protocol-registry* '()
-  "List of (name callback-pointer-thunk default-p) for the shared
-protocols array.  The default protocol goes into protocols[0]: lws
-dispatches plain HTTP requests to the first protocol, while raw and
-MQTT connections bind by explicit protocol name.")
+  "List of (name callback-pointer-thunk default-p tx-packet-size) for
+the shared protocols array.  The default protocol goes into
+protocols[0]: lws dispatches plain HTTP requests to the first protocol,
+while raw and MQTT connections bind by explicit protocol name.")
 
-(defun register-lws-protocol (name callback-thunk &key default)
-  (let ((entry (list name callback-thunk default)))
+(defun register-lws-protocol (name callback-thunk &key default tx-packet-size)
+  "TX-PACKET-SIZE, when given, is the most lws hands to the socket in
+one send for this protocol; without it lws sends at most its service
+buffer size (4096) per writable event."
+  (let ((entry (list name callback-thunk default tx-packet-size)))
     (if-let ((existing (assoc name *lws-protocol-registry* :test #'equal)))
       (setf (rest existing) (rest entry))
       (setf *lws-protocol-registry*
@@ -188,13 +191,16 @@ a timer object for CANCEL-TIMER.  Event loop thread only."
     (let ((protocols (cffi:foreign-alloc '(:struct lws-protocols)
                                          :count (1+ num-protocols))))
       (memset protocols '(:struct lws-protocols) (1+ num-protocols))
-      (iter (for (name callback-thunk nil) in (lws-protocol-registry-ordered))
+      (iter (for (name callback-thunk nil tx-packet-size) in (lws-protocol-registry-ordered))
             (for i from 0)
             (let ((entry (cffi:mem-aptr protocols '(:struct lws-protocols) i)))
               (setf (cffi:foreign-slot-value entry '(:struct lws-protocols) 'name)
                     (context-foreign-string context name)
                     (cffi:foreign-slot-value entry '(:struct lws-protocols) 'callback)
-                    (funcall callback-thunk))))
+                    (funcall callback-thunk))
+              (when tx-packet-size
+                (setf (cffi:foreign-slot-value entry '(:struct lws-protocols) 'tx-packet-size)
+                      tx-packet-size))))
       (setf (lws-context-protocols-ptr context) protocols)
       (with-lws-object (info
                         (:struct lws-context-creation-info)

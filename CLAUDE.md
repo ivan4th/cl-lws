@@ -66,8 +66,17 @@ levels are the usual LLL_* bitmask (255/4095 for more).
   per WRITEABLE, Lisp-side output queues)
 - `fd.lisp` - fd readability watching (lws owns the fd - pass a dup)
 - `http.lisp` - HTTP server ("cs-http" is the default protocol:
-  lws dispatches plain HTTP to protocols[0])
+  lws dispatches plain HTTP to protocols[0]); response bodies go out
+  in `*http-write-chunk-size*` chunks, one per WRITEABLE, with the lws
+  timeout re-armed per chunk (`*http-send-timeout-secs*`: a stalled
+  peer is dropped, a slow one has no total-time limit); Accept-Encoding
+  negotiation for registered content codings
 - `mqtt.lisp` - MQTT client sessions (op queue, one in-flight ack op)
+- `lws-compress.asd`, `compress.lisp`, `compress/` - gzip/zstd for
+  HTTP responses, a SEPARATE system like `lws-vnc`: libcscompress (zlib
+  + libzstd, one-shot `cscompress()`), registered as the "zstd" and
+  "gzip" content codings; `make -C compress check` runs its C tests
+  (needs the zlib and libzstd -dev packages)
 
 ## Gotchas
 
@@ -80,6 +89,12 @@ levels are the usual LLL_* bitmask (255/4095 for more).
 - lws_service ignores its timeout arg (since v3.2); the loop blocks
   until lws has something to do. Cross-thread wakeup = lws:defer
   (queue + lws_cancel_service).
+- lws arms PENDING_TIMEOUT_HTTP_CONTENT (context timeout_secs, 15 s)
+  when a request's headers arrive and never re-arms it while draining a
+  partial write: one big lws_write of a response body caps the whole
+  transfer at that deadline.  Hence the chunked body writes in http.lisp.
+- vtf's `(is (not FORM))` ignores the NOT unless FORM is a 2- or
+  3-element list (a bare variable, `(f)`, `(f a b c)`): use `is-false`.
 
 ## Modbus engine (csmb)
 

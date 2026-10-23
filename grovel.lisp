@@ -162,7 +162,8 @@
          (name "name" :type :string)
          (callback "callback" :type :pointer)
          (per-session-data-size "per_session_data_size" :type size-t)
-         (rx-buffer-size "rx_buffer_size" :type size-t))
+         (rx-buffer-size "rx_buffer_size" :type size-t)
+         (tx-packet-size "tx_packet_size" :type size-t))
 
 (cstruct lws-context-creation-info "struct lws_context_creation_info"
          (iface "iface" :type :string)
@@ -490,6 +491,7 @@
        ((:wsi-token-http-cookie "WSI_TOKEN_HTTP_COOKIE"))
        ((:wsi-token-http-content-length "WSI_TOKEN_HTTP_CONTENT_LENGTH"))
        ((:wsi-token-http-content-type "WSI_TOKEN_HTTP_CONTENT_TYPE"))
+       ((:wsi-token-http-accept-encoding "WSI_TOKEN_HTTP_ACCEPT_ENCODING"))
        ((:wsi-token-http-uri-args "WSI_TOKEN_HTTP_URI_ARGS")))
 
 (cstruct lws-sorted-usec-list "lws_sorted_usec_list_t"

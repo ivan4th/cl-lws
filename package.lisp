@@ -55,6 +55,20 @@
    #:http-request-body
    #:*http-max-body-size*
    #:*http-response-timeout-secs*
+   #:*http-send-timeout-secs*
+   #:*http-write-chunk-size*
+   ;; http content codings (compression)
+   #:*http-content-codings*
+   #:register-http-content-coding
+   #:*http-compress-min-size*
+   #:http-compressible-content-type-p
+   #:parse-accept-encoding
+   #:http-choose-content-coding
+   ;; compression (the LWS-COMPRESS system)
+   #:compress-octets
+   #:decompress-octets
+   #:*gzip-level*
+   #:*zstd-level*
    ;; mqtt client
    #:mqtt-connect
    #:mqtt-subscribe
